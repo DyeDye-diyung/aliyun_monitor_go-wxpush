@@ -47,6 +47,34 @@ def send_tg_report(tg_conf, message):
     except:
         pass
 
+def send_wxpush(wx_conf, title, content):
+    """Go-WXPush 统一推送"""
+    if not wx_conf:
+        return
+    
+    # 优先从配置获取地址，否则使用默认地址
+    wxpush_url = wx_conf.get('wxpush_api_url', 'https://push.hzz.cool/wxsend')
+    
+    wx_payload = {
+        "title": title,
+        "content": content,
+        "appid": wx_conf.get('appid'),
+        "secret": wx_conf.get('secret'),
+        "userid": wx_conf.get('userid'),
+        "template_id": wx_conf.get('template_id')
+    }
+    
+    try:
+        # 使用 POST 方式发送内容
+        response = requests.post(wxpush_url, json=wx_payload, timeout=30, verify=False)
+        response_data = response.json()
+        if response_data.get("errcode") == 0:
+            print(f"任务完成，go-wxpush 推送成功。")
+        else:
+            print(f"go-wxpush 推送返回错误: {response_data}")
+    except Exception as e:
+        print(f"推送过程发生异常: {e}")
+
 def do_common_request(client, domain, version, action, params=None, method='POST'):
     try:
         request = CommonRequest()
@@ -66,15 +94,18 @@ def do_common_request(client, domain, version, action, params=None, method='POST
 def main():
     config = load_config()
     users = config.get('users', [])
-    tg_conf = config.get('telegram', {})
+    # tg_conf = config.get('telegram', {})
+    wx_conf = config.get('wxpush', {}) # 获取 wxpush 配置
     
     # 提前获取实时汇率
     current_rate = get_usd_to_cny_rate()
     
+    success_count = 0
+    fail_count = 0
     report_lines = []
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    report_lines.append(f"📊 *[阿里云多账号 - 每日财报]*")
-    report_lines.append(f"📅 日期: {today} (当前汇率: {current_rate:.2f})\n")
+    # report_lines.append(f"📊 *[阿里云多账号 - 每日财报]*")
+    # report_lines.append(f"📅 日期: {today} (当前汇率: {current_rate:.2f})\n")
 
     for user in users:
         try:
@@ -164,12 +195,29 @@ def main():
                 f"   📝 评价: {status_icon}\n"
             )
             report_lines.append(user_report)
+            success_count += 1
 
         except Exception as e:
             report_lines.append(f"❌ *{user.get('name', 'Unknown')}* Error: {str(e)}\n")
+            fail_count += 1
 
-    final_msg = "\n".join(report_lines)
-    send_tg_report(tg_conf, final_msg)
+    # final_msg = "\n".join(report_lines)
+    # send_tg_report(tg_conf, final_msg)
+    
+    # --- 构建推送内容 ---
+    push_title = f"阿里云财报: 成功{success_count}, 失败{fail_count}"
+    
+    # 1. 准备统计头部
+    header = f"📊 *[阿里云多账号 - 每日财报]*\n"
+    header += f"📅 日期: {today} (汇率: {current_rate:.2f})\n"
+    header += f"✅ 成功账号：{success_count}，❌ 失败账号：{fail_count}\n"
+    header += "--------------------------------\n"
+    
+    # 2. 拼接完整内容
+    final_summary = header + "\n".join(report_lines)
+
+    # --- 执行推送 ---
+    send_wxpush(wx_conf, push_title, final_summary)
 
 if __name__ == "__main__":
     main()
