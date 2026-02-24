@@ -33,6 +33,23 @@ def send_tg(tg_conf, text):
                       json={"chat_id": tg_conf['chat_id'], "text": text, "parse_mode": "Markdown"}, timeout=5)
     except: pass
 
+def send_wxpush(wx_conf, title, content):
+    """Go-WXPush 统一推送"""
+    if not wx_conf: return
+    try:
+        wxpush_url = wx_conf.get('wxpush_api_url', 'https://push.hzz.cool/wxsend')
+        wx_payload = {
+            "title": title,
+            "content": content,
+            "appid": wx_conf.get('appid'),
+            "secret": wx_conf.get('secret'),
+            "userid": wx_conf.get('userid'),
+            "template_id": wx_conf.get('template_id')
+        }
+        requests.post(wxpush_url, json=wx_payload, timeout=10, verify=False)
+    except Exception as e:
+        logger.error(f"Push failed: {e}")
+
 def do_request(client, action, params=None):
     try:
         req = CommonRequest()
@@ -47,7 +64,7 @@ def do_request(client, action, params=None):
         logger.error(f"API {action} failed: {e}")
         return None
 
-def check(user, tg_conf):
+def check(user, wx_conf):
     try:
         # 数据清洗
         target_id = user['instance_id'].strip()
@@ -89,20 +106,27 @@ def check(user, tg_conf):
             if status == "Stopped":
                 logger.info(f"[{user['name']}] Start instance...")
                 do_request(client, 'StartInstance', {'InstanceId': target_id})
-                send_tg(tg_conf, f"✅ *[{user['name']}]* 流量安全 ({curr_gb:.2f}GB)，已恢复运行。")
+                # send_tg(tg_conf, f"✅ *[{user['name']}]* 流量安全 ({curr_gb:.2f}GB)，已恢复运行。")
+                send_wxpush(wx_conf, "CDT 流量止损恢复", f"✅ [{user['name']}] 流量安全 ({curr_gb:.2f}GB)，已恢复运行。")
         else:
             if status == "Running":
                 logger.info(f"[{user['name']}] Stop instance...")
                 do_request(client, 'StopInstance', {'InstanceId': target_id})
-                send_tg(tg_conf, f"🚨 *[{user['name']}]* 流量超标 ({curr_gb:.2f}GB)，已强制关机！")
+                # send_tg(tg_conf, f"🚨 *[{user['name']}]* 流量超标 ({curr_gb:.2f}GB)，已强制关机！")
+                send_wxpush(wx_conf, "CDT 流量止损触发", f"🚨 [{user['name']}] 流量超标 ({curr_gb:.2f}GB)，已执行强制关机！")
 
     except Exception as e:
         logger.error(f"Check failed: {e}")
 
 def main():
     cfg = load_config()
+    # for u in cfg.get('users', []):
+    #     check(u, cfg.get('telegram', {}))
+    
+    # 注意这里 key 改为了 wxpush
+    wx_conf = cfg.get('wxpush', {})
     for u in cfg.get('users', []):
-        check(u, cfg.get('telegram', {}))
+        check(u, wx_conf)
 
 if __name__ == "__main__":
     main()
