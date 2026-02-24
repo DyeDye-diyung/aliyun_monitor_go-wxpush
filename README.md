@@ -4,7 +4,9 @@
 
 3. 金额部分根据接口返回货币单位处理人民币，适应阿里云/阿里云国际需要
 
-4. RAM账号权限收敛：
+4. 推送方式从telegram机器人改为可以自己搭建的[Go-WXPush](https://github.com/hezhizheng/go-wxpush)的webhook推送
+
+5. RAM账号权限收敛：
 
 
 
