@@ -1,3 +1,20 @@
+1. 为统一支持阿里云/阿里云国际，修改bss接口地址business.aliyuncs.com
+
+2. 更改BSS账单所调用的接口为DescribeInstanceBill，且账单金额仅统计配置的实例ID，EIP在绑状态不会产生账单，而流量部分只需关注流量统计故也不计算金额
+
+3. 金额部分根据接口返回货币单位处理人民币，适应阿里云/阿里云国际需要
+
+4. RAM账号权限收敛：
+
+
+
+- AliyunECSFullAccess 此权限风险较大，可以收敛到资源组级别授权，因此增加资源组ID配置，否则接口无法调通
+
+- AliyunBSSReadOnlyAccess 仍然需要帐号级授权
+
+- AliyunCDTReadOnlyAccess 收敛到只读权限，仍然需要帐号级授权
+
+---
 
 #  阿里云国际版 CDT 流量监控 & 自动止损脚本
 
