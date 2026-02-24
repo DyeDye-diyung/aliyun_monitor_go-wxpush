@@ -67,7 +67,7 @@ read -p "请输入 Telegram Chat ID: " TG_ID
 echo -e "\n${BLUE}### 配置阿里云 RAM ###${NC}"
 echo -e "请前往阿里云 RAM 控制台创建用户："
 echo -e "🔗 地址: ${YELLOW}https://ram.console.alibabacloud.com/users${NC}"
-echo -e "⚠️  权限要求: AliyunECSFullAccess, AliyunCDTFullAccess, AliyunBSSReadOnlyAccess"
+echo -e "⚠️  权限要求: AliyunECSFullAccess, AliyunCDTReadOnlyAccess, AliyunBSSReadOnlyAccess"
 
 USERS_JSON=""
 
