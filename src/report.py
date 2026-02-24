@@ -22,6 +22,21 @@ def load_config():
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+def get_usd_to_cny_rate():
+    """获取实时汇率 (USD/CNY)，失败则返回保底汇率 7.0"""
+    try:
+        # 使用无需 API Key 的公开接口获取汇率
+        url = "https://api.exchangerate-api.com/v4/latest/USD"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            rate = data.get('rates', {}).get('CNY')
+            if rate:
+                return float(rate)
+    except:
+        pass
+    return 7.0  # 网络请求失败时的保底汇率
+
 def send_tg_report(tg_conf, message):
     if not tg_conf.get('bot_token') or not tg_conf.get('chat_id'):
         return
@@ -53,10 +68,13 @@ def main():
     users = config.get('users', [])
     tg_conf = config.get('telegram', {})
     
+    # 提前获取实时汇率
+    current_rate = get_usd_to_cny_rate()
+    
     report_lines = []
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     report_lines.append(f"📊 *[阿里云多账号 - 每日财报]*")
-    report_lines.append(f"📅 日期: {today}\n")
+    report_lines.append(f"📅 日期: {today} (当前汇率: {current_rate:.2f})\n")
 
     for user in users:
         try:
@@ -80,7 +98,9 @@ def main():
             # 2. BSS 账单
             bill_params = {'BillingCycle': datetime.datetime.now().strftime("%Y-%m"), 'InstanceID': target_id}
             bill_data = do_common_request(client, 'business.aliyuncs.com', '2017-12-14', 'DescribeInstanceBill', bill_params)
+            
             bill_amount = -1
+            bill_currency = "USD"
             if bill_data:
                 items = bill_data.get('Data', {}).get('Items', [])
                 if items:
@@ -94,7 +114,6 @@ def main():
             ecs_data = do_common_request(client, 'ecs.aliyuncs.com', '2014-05-26', 'DescribeInstances', ecs_params)
             
             status, ip, spec = "NotFound", "N/A", "N/A"
-            
             if ecs_data and 'Instances' in ecs_data:
                 for inst in ecs_data['Instances'].get('Instance', []):
                     if inst['InstanceId'] == target_id:
@@ -107,28 +126,30 @@ def main():
                         # Spec (0.5G 内存修复)
                         cpu = inst.get('Cpu', 0)
                         mem_mb = inst.get('Memory', 0)
-                        if mem_mb > 0 and mem_mb % 1024 == 0:
-                            mem_str = f"{int(mem_mb/1024)}"
-                        else:
-                            mem_str = f"{mem_mb/1024:.1f}"
-                        
+                        mem_str = f"{int(mem_mb/1024)}" if mem_mb % 1024 == 0 else f"{mem_mb/1024:.1f}"
                         spec = f"{cpu}C{mem_str}G"
                         break 
 
-            # 4. 判定
+            # 4. 汇率换算与判定
             quota = user.get('traffic_limit', 180)
-            bill_limit = user.get('bill_threshold', 1.0)
+            bill_limit_usd = user.get('bill_threshold', 1.0) # 用户配置的是美元
             percent = (traffic_gb / quota) * 100
             
-            bill_str = f"${bill_amount:.2f}" if bill_amount != -1 else "Fail"
-
-            if bill_currency == "CNY": # 如果阿里云用户账单是人民币
-                bill_str = f"¥{bill_amount:.2f}" if bill_amount != -1 else "Fail"
-                bill_limit = bill_limit * 7.0  # USD to CNY
+            if bill_amount == -1:
+                bill_str = "查询失败"
+                usd_val = 0.0
+            else:
+                if bill_currency == "CNY":
+                    cny_val = bill_amount
+                    usd_val = bill_amount / current_rate
+                else:
+                    usd_val = bill_amount
+                    cny_val = bill_amount * current_rate
+                bill_str = f"${usd_val:.2f} (预估¥{cny_val:.2f})"
 
             status_icon = "✅"
             if traffic_gb > quota: status_icon = "⚠️ 流量超标"
-            if bill_amount > bill_limit: status_icon = "💸 扣费预警"
+            if usd_val > bill_limit_usd: status_icon = "💸 扣费预警"
             
             run_icon = "🟢" if status == "Running" else "🔴"
             if status == "Stopped": run_icon = "⚫"
