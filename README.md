@@ -72,7 +72,7 @@
 
 ### 初始化步骤
 
-1. 在本仓库中找到并打开 * 👉 **[`vnc.sh`](https://github.com/10000ge10000/aliyun_monitor/blob/main/vnc.sh)**
+1. 在本仓库中找到并打开 * 👉 **[`vnc.sh`](https://github.com/DyeDye-diyung/aliyun_monitor_go-wxpush/blob/main/vnc.sh)**
 2. **复制 `vnc.sh` 中的全部内容**
 3. 登录阿里云实例的 **VNC 控制台**
 4. 将代码 **完整粘贴到 VNC 界面并回车执行**
@@ -105,7 +105,7 @@
 2. 使用 **root 用户** 登录 Alpine 后，下载并执行脚本：
 
 ```bash
-wget -O install2.sh https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/install2.sh
+wget -O install2.sh https://raw.githubusercontent.com/DyeDye-diyung/aliyun_monitor_go-wxpush/main/install2.sh
 chmod +x install2.sh
 ./install2.sh
 ````
@@ -126,7 +126,7 @@ chmod +x install2.sh
 使用 **root 用户** 执行：
 
 ```bash
-wget -N https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/install.sh \
+wget -N https://raw.githubusercontent.com/DyeDye-diyung/aliyun_monitor_go-wxpush/main/install.sh \
 && chmod +x install.sh \
 && ./install.sh
 ```
@@ -143,7 +143,7 @@ wget -N https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/insta
 ## 🗑️ 卸载
 
 ```bash
-wget -N https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/uninstall.sh \
+wget -N https://raw.githubusercontent.com/DyeDye-diyung/aliyun_monitor_go-wxpush/main/uninstall.sh \
 && chmod +x uninstall.sh \
 && ./uninstall.sh
 ```
