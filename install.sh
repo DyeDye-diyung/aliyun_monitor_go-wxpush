@@ -58,11 +58,26 @@ if [ ! -s "${TARGET_DIR}/monitor.py" ]; then
 fi
 
 # 6. 交互式配置
-echo -e "\n${BLUE}### 配置 Telegram ###${NC}"
-echo -e "1. 联系 ${CYAN}@BotFather${NC} -> 创建机器人获取 Token"
-echo -e "2. 联系 ${CYAN}@userinfobot${NC} -> 获取您的 Chat ID"
-read -p "请输入 Telegram Bot Token: " TG_TOKEN
-read -p "请输入 Telegram Chat ID: " TG_ID
+# echo -e "\n${BLUE}### 配置 Telegram ###${NC}"
+# echo -e "1. 联系 ${CYAN}@BotFather${NC} -> 创建机器人获取 Token"
+# echo -e "2. 联系 ${CYAN}@userinfobot${NC} -> 获取您的 Chat ID"
+# read -p "请输入 Telegram Bot Token: " TG_TOKEN
+# read -p "请输入 Telegram Chat ID: " TG_ID
+echo -e "\n${BLUE}### 配置 Go-WXPush ###${NC}"
+echo -e "${CYAN}💡 提示: 如果使用公共接口，URL 请直接回车跳过${NC}"
+read -p "请输入 WXPush API URL (默认 https://push.hzz.cool/wxsend): " WX_URL
+WX_URL=${WX_URL:-"https://push.hzz.cool/wxsend"}
+read -p "请输入 AppID: " WX_APPID
+read -p "请输入 Secret: " WX_SECRET
+read -p "请输入 UserID (接收者ID): " WX_USERID
+read -p "请输入 Template ID (模板ID): " WX_TEMPLATE
+
+# 去除多余空格
+WX_URL=$(echo "$WX_URL" | tr -d '[:space:]')
+WX_APPID=$(echo "$WX_APPID" | tr -d '[:space:]')
+WX_SECRET=$(echo "$WX_SECRET" | tr -d '[:space:]')
+WX_USERID=$(echo "$WX_USERID" | tr -d '[:space:]')
+WX_TEMPLATE=$(echo "$WX_TEMPLATE" | tr -d '[:space:]')
 
 echo -e "\n${BLUE}### 配置阿里云 RAM ###${NC}"
 echo -e "请前往阿里云 RAM 控制台创建用户："
@@ -162,11 +177,25 @@ while true; do
 done
 
 # 生成配置
+# cat > "${TARGET_DIR}/config.json" <<EOF
+# {
+#     "telegram": {
+#         "bot_token": "$TG_TOKEN",
+#         "chat_id": "$TG_ID"
+#     },
+#     "users": [
+#         $USERS_JSON
+#     ]
+# }
+# EOF
 cat > "${TARGET_DIR}/config.json" <<EOF
 {
-    "telegram": {
-        "bot_token": "$TG_TOKEN",
-        "chat_id": "$TG_ID"
+    "wxpush": {
+        "wxpush_api_url": "$WX_URL",
+        "appid": "$WX_APPID",
+        "secret": "$WX_SECRET",
+        "userid": "$WX_USERID",
+        "template_id": "$WX_TEMPLATE"
     },
     "users": [
         $USERS_JSON
