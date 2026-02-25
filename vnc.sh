@@ -1,7 +1,7 @@
 #!/bin/sh
 # Alpine VNC Auto Install - Paste in VNC text box (max 2000 chars, ASCII only)
 # For Aliyun ECS with Alpine virt ISO custom image
-P="yiwan123"
+P="dyedyediyung"
 D="/dev/vda"
 R="http://mirrors.aliyun.com/alpine/v3.23"
 setup-interfaces -a -r
