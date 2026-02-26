@@ -93,6 +93,7 @@ def do_common_request(client, domain, version, action, params=None, method='POST
         response = client.do_action_with_exception(request)
         return json.loads(response.decode('utf-8'))
     except Exception as e:
+        print(f"❌ API Error [{action}]: {str(e)}")  # 打印具体报错信息
         return None
 
 def main():
@@ -108,7 +109,7 @@ def main():
     fail_count = 0
     report_lines = []
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    # report_lines.append(f"📊 *[阿里云多账号 - 每日财报]*")
+    # report_lines.append(f"📊 [阿里云多账号 - 每日财报]")
     # report_lines.append(f"📅 日期: {today} (当前汇率: {current_rate:.2f})\n")
 
     for user in users:
@@ -147,6 +148,7 @@ def main():
             if resgroup:
                 ecs_params['ResourceGroupId'] = resgroup
             ecs_data = do_common_request(client, 'ecs.aliyuncs.com', '2014-05-26', 'DescribeInstances', ecs_params)
+            # print(f"DEBUG - ECS API Response: {json.dumps(ecs_data)}") # 查看报错
             
             status, ip, spec = "NotFound", "N/A", "N/A"
             if ecs_data and 'Instances' in ecs_data:
@@ -212,7 +214,7 @@ def main():
     push_title = f"阿里云财报: 成功{success_count}, 失败{fail_count}"
     
     # 1. 准备统计头部
-    header = f"📊 *[阿里云多账号 - 每日财报]*\n"
+    header = f"📊 [阿里云多账号 - 每日财报]\n"
     header += f"📅 日期: {today} (汇率: {current_rate:.2f})\n"
     header += f"✅ 成功账号：{success_count}，❌ 失败账号：{fail_count}\n"
     header += "--------------------------------\n"
