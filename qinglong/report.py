@@ -224,6 +224,7 @@ def main():
 
     # --- 执行推送 ---
     send_wxpush(wx_conf, push_title, final_summary)
+    print(f"\n{final_summary}")
 
 if __name__ == "__main__":
     main()
