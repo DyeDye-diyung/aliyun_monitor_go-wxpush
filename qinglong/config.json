@@ -15,8 +15,7 @@
       "resgroup": "rg-aek2xxxxxxx", 
       "instance_id": "i-j6cxxxxxxxxxxxxxx",
       "traffic_limit": 180,
-      "bill_threshold": 1.0,
-      "quota": 200
+      "bill_threshold": 1.0
     },
     {
       "name": "阿里云新加坡",
@@ -26,8 +25,7 @@
       "resgroup": "",
       "instance_id": "i-t4nxxxxxxxxxxxxxx",
       "traffic_limit": 150,
-      "bill_threshold": 0.5,
-      "quota": 200
+      "bill_threshold": 0.5
     }
   ]
 }
