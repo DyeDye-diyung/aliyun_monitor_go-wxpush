@@ -1,0 +1,21 @@
+{
+    "wxpush": {
+        "wxpush_api_url": "https://push.hzz.cool/wxsend",
+        "appid": "你的_APPID",
+        "secret": "你的_SECRET",
+        "userid": "你的_USERID",
+        "template_id": "你的_TEMPLATE_ID"
+    },
+    "users": [
+        {
+            "name": "香港节点",
+            "ak": "你的AK",
+            "sk": "你的SK",
+            "region": "cn-hongkong",
+            "resgroup": "rg-xxxx",
+            "instance_id": "i-xxxx",
+            "traffic_limit": 180,
+            "bill_threshold": 1.0
+        }
+    ]
+}
