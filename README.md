@@ -8,13 +8,13 @@
 
 5. RAM账号权限收敛：
 
-
-
 - AliyunECSFullAccess 此权限风险较大，可以收敛到资源组级别授权，因此增加资源组ID配置，否则接口无法调通
 
 - AliyunBSSReadOnlyAccess 仍然需要帐号级授权
 
 - AliyunCDTReadOnlyAccess 收敛到只读权限，仍然需要帐号级授权
+
+---
 
 ## 你应该如何执行权限收敛？
 
@@ -47,6 +47,23 @@
 
 - `AliyunBSSReadOnlyAccess`
 - `AliyunCDTReadOnlyAccess`
+
+---
+
+`config.json`的`user`部分配置：
+
+### 📋 `users` 字段详解
+
+| 字段名 | 填写内容 | 获取路径 / 示例 |
+| --- | --- | --- |
+| `name` | 自定义备注名 | 随便填，如 `"香港主站"`。用于推送时显示。 |
+| `ak` | 阿里云 AccessKey ID | RAM 用户详情页创建，如 `"LTAI5t..."`。 |
+| `sk` | 阿里云 AccessKey Secret | 创建 AK 时保存的密钥，如 `"AbCd123..."`。 |
+| `region` | 实例所在的地域 ID | 如 `"cn-hongkong"`、`"ap-southeast-1"` (新加坡)。 |
+| `resgroup` | 资源组 ID | 若权限收敛到资源组，填 `"rg-xxxx"`；否则**留空** `""`。 |
+| `instance_id` | ECS 实例 ID | ECS 实例列表页，以 `"i-"` 开头，如 `"i-j6c..."`。 |
+| `traffic_limit` | 关机流量阈值 | 数字（GB）。超过此值 `monitor.py` 会执行关机。如 `180`。 |
+| `bill_threshold` | 账单报警阈值 | 数字（美元）。超过此金额 `report.py` 会显示预警。如 `1.0`。 |
 
 ---
 
