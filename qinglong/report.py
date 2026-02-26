@@ -1,0 +1,227 @@
+# -*- coding: utf-8 -*-
+import json
+import requests
+import datetime
+import os
+import sys
+import warnings
+
+warnings.filterwarnings("ignore")
+
+try:
+    from aliyunsdkcore.client import AcsClient
+    from aliyunsdkcore.request import CommonRequest
+except ImportError:
+    sys.exit(1)
+
+# CONFIG_FILE = '/opt/scripts/config.json'
+
+# --- 最小化修改：自动获取脚本所在目录 ---
+curr_dir = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(curr_dir, 'config.json')
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        sys.exit(1)
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def get_usd_to_cny_rate():
+    """获取实时汇率 (USD/CNY)，失败则返回保底汇率 7.0"""
+    try:
+        # 使用无需 API Key 的公开接口获取汇率
+        url = "https://api.exchangerate-api.com/v4/latest/USD"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            rate = data.get('rates', {}).get('CNY')
+            if rate:
+                return float(rate)
+    except:
+        pass
+    return 7.0  # 网络请求失败时的保底汇率
+
+def send_tg_report(tg_conf, message):
+    if not tg_conf.get('bot_token') or not tg_conf.get('chat_id'):
+        return
+    try:
+        url = f"https://api.telegram.org/bot{tg_conf['bot_token']}/sendMessage"
+        data = {"chat_id": tg_conf['chat_id'], "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=data, timeout=10)
+    except:
+        pass
+
+def send_wxpush(wx_conf, title, content):
+    """Go-WXPush 统一推送"""
+    if not wx_conf:
+        return
+    
+    # 优先从配置获取地址，否则使用默认地址
+    wxpush_url = wx_conf.get('wxpush_api_url', 'https://push.hzz.cool/wxsend')
+    
+    wx_payload = {
+        "title": title,
+        "content": content,
+        "appid": wx_conf.get('appid'),
+        "secret": wx_conf.get('secret'),
+        "userid": wx_conf.get('userid'),
+        "template_id": wx_conf.get('template_id')
+    }
+    
+    try:
+        # 使用 POST 方式发送内容
+        response = requests.post(wxpush_url, json=wx_payload, timeout=30, verify=False)
+        response_data = response.json()
+        if response_data.get("errcode") == 0:
+            print(f"任务完成，go-wxpush 推送成功。")
+        else:
+            print(f"go-wxpush 推送返回错误: {response_data}")
+    except Exception as e:
+        print(f"推送过程发生异常: {e}")
+
+def do_common_request(client, domain, version, action, params=None, method='POST'):
+    try:
+        request = CommonRequest()
+        request.set_domain(domain)
+        request.set_version(version)
+        request.set_action_name(action)
+        request.set_method(method)
+        request.set_protocol_type('https')
+        if params:
+            for k, v in params.items():
+                request.add_query_param(k, v)
+        response = client.do_action_with_exception(request)
+        return json.loads(response.decode('utf-8'))
+    except Exception as e:
+        return None
+
+def main():
+    config = load_config()
+    users = config.get('users', [])
+    # tg_conf = config.get('telegram', {})
+    wx_conf = config.get('wxpush', {}) # 获取 wxpush 配置
+    
+    # 提前获取实时汇率
+    current_rate = get_usd_to_cny_rate()
+    
+    success_count = 0
+    fail_count = 0
+    report_lines = []
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    # report_lines.append(f"📊 *[阿里云多账号 - 每日财报]*")
+    # report_lines.append(f"📅 日期: {today} (当前汇率: {current_rate:.2f})\n")
+
+    for user in users:
+        try:
+            target_id = user.get('instance_id', '').strip()
+            target_region = user.get('region', '').strip()
+            resgroup = user.get('resgroup', '').strip()
+
+            # [名字显示修复] 优先使用备注，没有则用ID，再没有则用Unknown
+            user_name = user.get('name', '').strip()
+            if not user_name:
+                user_name = target_id if target_id else "Unknown_Device"
+            
+            client = AcsClient(user['ak'].strip(), user['sk'].strip(), target_region)
+            
+            # 1. CDT 流量
+            traffic_data = do_common_request(client, 'cdt.aliyuncs.com', '2021-08-13', 'ListCdtInternetTraffic')
+            traffic_gb = 0.0
+            if traffic_data:
+                traffic_gb = sum(d.get('Traffic', 0) for d in traffic_data.get('TrafficDetails', [])) / (1024**3)
+
+            # 2. BSS 账单
+            bill_params = {'BillingCycle': datetime.datetime.now().strftime("%Y-%m"), 'InstanceID': target_id}
+            bill_data = do_common_request(client, 'business.aliyuncs.com', '2017-12-14', 'DescribeInstanceBill', bill_params)
+            
+            bill_amount = -1
+            bill_currency = "USD"
+            if bill_data:
+                items = bill_data.get('Data', {}).get('Items', [])
+                if items:
+                    bill_amount = float(items[0].get('PretaxAmount', 0))
+                    bill_currency = items[0].get('Currency', 'USD')
+
+            # 3. ECS 状态
+            ecs_params = {'PageSize': 50, 'RegionId': target_region}
+            if resgroup:
+                ecs_params['ResourceGroupId'] = resgroup
+            ecs_data = do_common_request(client, 'ecs.aliyuncs.com', '2014-05-26', 'DescribeInstances', ecs_params)
+            
+            status, ip, spec = "NotFound", "N/A", "N/A"
+            if ecs_data and 'Instances' in ecs_data:
+                for inst in ecs_data['Instances'].get('Instance', []):
+                    if inst['InstanceId'] == target_id:
+                        status = inst.get('Status', 'Unknown')
+                        # IP
+                        pub = inst.get('PublicIpAddress', {}).get('IpAddress', [])
+                        eip = inst.get('EipAddress', {}).get('IpAddress', "")
+                        ip = eip if eip else (pub[0] if pub else "无公网IP")
+                        
+                        # Spec (0.5G 内存修复)
+                        cpu = inst.get('Cpu', 0)
+                        mem_mb = inst.get('Memory', 0)
+                        mem_str = f"{int(mem_mb/1024)}" if mem_mb % 1024 == 0 else f"{mem_mb/1024:.1f}"
+                        spec = f"{cpu}C{mem_str}G"
+                        break 
+
+            # 4. 汇率换算与判定
+            quota = user.get('traffic_limit', 180)
+            bill_limit_usd = user.get('bill_threshold', 1.0) # 用户配置的是美元
+            percent = (traffic_gb / quota) * 100
+            
+            if bill_amount == -1:
+                bill_str = "查询失败"
+                usd_val = 0.0
+            else:
+                if bill_currency == "CNY":
+                    cny_val = bill_amount
+                    usd_val = bill_amount / current_rate
+                else:
+                    usd_val = bill_amount
+                    cny_val = bill_amount * current_rate
+                bill_str = f"${usd_val:.2f} (预估¥{cny_val:.2f})"
+
+            status_icon = "✅"
+            if traffic_gb > quota: status_icon = "⚠️ 流量超标"
+            if usd_val > bill_limit_usd: status_icon = "💸 扣费预警"
+            
+            run_icon = "🟢" if status == "Running" else "🔴"
+            if status == "Stopped": run_icon = "⚫"
+            if status == "NotFound": run_icon = "❓"
+
+            user_report = (
+                f"👤 *{user_name}* ({spec})\n"
+                f"   🖥️ 状态: {run_icon} {status}\n"
+                f"   🌐 IP: `{ip}`\n"
+                f"   📉 流量: {traffic_gb:.2f} GB ({percent:.1f}%)\n"
+                f"   💰 账单: *{bill_str}*\n"
+                f"   📝 评价: {status_icon}\n"
+            )
+            report_lines.append(user_report)
+            success_count += 1
+
+        except Exception as e:
+            report_lines.append(f"❌ *{user.get('name', 'Unknown')}* Error: {str(e)}\n")
+            fail_count += 1
+
+    # final_msg = "\n".join(report_lines)
+    # send_tg_report(tg_conf, final_msg)
+    
+    # --- 构建推送内容 ---
+    push_title = f"阿里云财报: 成功{success_count}, 失败{fail_count}"
+    
+    # 1. 准备统计头部
+    header = f"📊 *[阿里云多账号 - 每日财报]*\n"
+    header += f"📅 日期: {today} (汇率: {current_rate:.2f})\n"
+    header += f"✅ 成功账号：{success_count}，❌ 失败账号：{fail_count}\n"
+    header += "--------------------------------\n"
+    
+    # 2. 拼接完整内容
+    final_summary = header + "\n".join(report_lines)
+
+    # --- 执行推送 ---
+    send_wxpush(wx_conf, push_title, final_summary)
+
+if __name__ == "__main__":
+    main()
