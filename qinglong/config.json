@@ -7,15 +7,27 @@
         "template_id": "你的_TEMPLATE_ID"
     },
     "users": [
-        {
-            "name": "香港节点",
-            "ak": "你的AK",
-            "sk": "你的SK",
-            "region": "cn-hongkong",
-            "resgroup": "rg-xxxx",
-            "instance_id": "i-xxxx",
-            "traffic_limit": 180,
-            "bill_threshold": 1.0
-        }
-    ]
+    {
+      "name": "阿里云香港",
+      "ak": "LTAI5t9xxxxxxxxxxxxxx",
+      "sk": "abcdef1234567890xxxxxxx",
+      "region": "cn-hongkong",
+      "resgroup": "rg-aek2xxxxxxx", 
+      "instance_id": "i-j6cxxxxxxxxxxxxxx",
+      "traffic_limit": 180,
+      "bill_threshold": 1.0,
+      "quota": 200
+    },
+    {
+      "name": "阿里云新加坡",
+      "ak": "LTAI5t9xxxxxxxxxxxxxx",
+      "sk": "abcdef1234567890xxxxxxx",
+      "region": "ap-southeast-1",
+      "resgroup": "",
+      "instance_id": "i-t4nxxxxxxxxxxxxxx",
+      "traffic_limit": 150,
+      "bill_threshold": 0.5,
+      "quota": 200
+    }
+  ]
 }
