@@ -115,7 +115,7 @@ def check(user, wx_conf):
                 # send_tg(tg_conf, f"✅ *[{user['name']}]* 流量安全 ({curr_gb:.2f}GB)，已恢复运行。")
                 send_wxpush(wx_conf, "CDT 流量止损恢复", f"✅ [{user['name']}] 流量安全 ({curr_gb:.2f}GB)，已恢复运行。")
             else:
-                print(f"🟢[{user['name']}] 流量正常，机器运行中")
+                print(f"🟢[{user['name']}] 流量正常，机器运行中 (当前: {curr_gb:.2f}GB / 阈值: {limit}GB)，机器运行中")
         else:
             if status == "Running":
                 logger.info(f"[{user['name']}] Stop instance...")
@@ -123,7 +123,7 @@ def check(user, wx_conf):
                 # send_tg(tg_conf, f"🚨 *[{user['name']}]* 流量超标 ({curr_gb:.2f}GB)，已强制关机！")
                 send_wxpush(wx_conf, "CDT 流量止损触发", f"🚨 [{user['name']}] 流量超标 ({curr_gb:.2f}GB)，已执行强制关机！")
             else:
-                print(f"🔴[{user['name']}] 流量用满，机器停止中")
+                print(f"🔴[{user['name']}] 流量用满，机器停止中 (当前: {curr_gb:.2f}GB / 阈值: {limit}GB)，机器停止中")
 
     except Exception as e:
         logger.error(f"Check failed: {e}")
