@@ -1,15 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Azure for Students 每日报告 (增强版)
-
-特性：
-1. 实时获取 USD/CNY 汇率，所有金额均支持美元与预估人民币双换算展示。
-2. 免额外 SDK 依赖，自动通过 Azure REST API 获取 VM 公网 IP 地址。
-3. 订阅级 Credit/Cost 缓存 (credit_cache)，多 VM 场景下防 429 限流。
-4. 查询 VM 状态 / 规格 / Region / 当月出站流量及额度占比。
-5. 联动 azure_monitor_state.json，直观展示是否处于止损熔断保护状态。
-6. 支持 paused / disabled 停机忽略开关。
-7. API 严格超时控制 + 3 次阶梯重试 + Linux 并发锁 + 日志按天轮转。
+Azure for Students 每日报告 (修复货币自适应换算)
 """
 
 import json
@@ -390,6 +381,7 @@ def get_credit_start_date(user):
 
 
 def get_credit_usage(user, credential):
+    """查询 Student Credit 周期累计成本，自适应支持 USD / CNY 返回"""
     token = get_token(credential)
     subscription_id = user["subscription_id"].strip()
     url = (
@@ -432,7 +424,7 @@ def get_credit_usage(user, credential):
     columns = properties.get("columns", [])
     rows = properties.get("rows", [])
     if not rows:
-        return 0.0
+        return 0.0, "USD"
 
     names = [c.get("name", "") for c in columns]
     index = names.index("PreTaxCost") if "PreTaxCost" in names else None
@@ -446,6 +438,8 @@ def get_credit_usage(user, credential):
         if len(row) > index and row[index] is not None:
             total += float(row[index])
 
+    # 提取货币单位 (支持 USD 与 CNY 自适应)
+    currency = "USD"
     currency_index = names.index("Currency") if "Currency" in names else None
     if currency_index is not None:
         currencies = {
@@ -455,12 +449,10 @@ def get_credit_usage(user, credential):
         }
         if len(currencies) > 1:
             raise RuntimeError(f"Cost API 返回多个货币单位: {currencies}")
-        if currencies and next(iter(currencies)) != "USD":
-            raise RuntimeError(
-                f"Cost API 返回货币为 {next(iter(currencies))}，当前脚本按 USD 管理。"
-            )
+        if currencies:
+            currency = next(iter(currencies))
 
-    return total
+    return total, currency
 
 
 # ============================================================
@@ -554,7 +546,7 @@ def main():
                 traffic_limit = float(user.get("traffic_limit", 110))
                 credit_limit = float(user.get("credit_limit", 100))
 
-                # 复用订阅级 Credit 缓存
+                # 复用订阅级 Credit 缓存 (自适应汇率折算为标准 USD)
                 sub_key = f"{user['subscription_id'].strip()}::{user.get('credit_start_date', '').strip()}"
                 if sub_key in credit_cache:
                     credit_used, credit_error = credit_cache[sub_key]
@@ -562,7 +554,13 @@ def main():
                     credit_used = None
                     credit_error = None
                     try:
-                        credit_used = get_credit_usage(user, credential)
+                        raw_cost, cur = get_credit_usage(user, credential)
+                        if cur == "CNY":
+                            credit_used = raw_cost / current_rate
+                            logger.info(f"[{name}] Cost API 返回 ¥{raw_cost:.2f} CNY，已折算为 ${credit_used:.2f} USD")
+                        else:
+                            credit_used = raw_cost
+                            logger.info(f"[{name}] Cost API 返回 ${credit_used:.2f} USD")
                     except Exception as e:
                         credit_error = e
                         logger.error(f"[{name}] Cost 查询失败: {e}")
