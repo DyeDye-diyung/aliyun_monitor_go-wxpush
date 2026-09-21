@@ -164,3 +164,18 @@ Azure 采用企业级 Service Principal（服务主体）鉴权，程序最终�
         }
     ]
 }
+```
+
+---
+
+## 6. 青龙面板安装依赖
+
+在青龙面板的 **“依赖管理” → “Python3”** 添加（或在容器终端执行 `pip3 install`）：
+
+```
+azure-identity
+azure-mgmt-compute
+requests
+```
+
+*(注：由于公网 IP 与流量均采用 REST 直调，无需安装笨重的网络和监控专用 SDK。)*
