@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Azure for Students 每日报告
+Azure for Students 每日报告 (增强版)
 
-与原项目 report.py 完全独立。
-青龙每天运行一次，负责：
-1. 查询 VM 状态 / 规格 / Region
-2. 查询当月 Network Out Total
-3. 查询 Student Credit 周期累计成本
-4. 展示 100GB 通用免费额度 + 15GB Student 免费额度
-5. 展示流量止损阈值、Credit 预警线、Credit 剩余额度
-6. 读取 azure_monitor_state.json，展示是否处于自动保护状态
-7. 支持 paused / disabled
-8. API 严格超时 + 3 次阶梯重试
-9. IPv4 / SNI 兼容
-10. 日志轮转、并发锁、Markdown 防炸、失败统计
+特性：
+1. 实时获取 USD/CNY 汇率，所有金额均支持美元与预估人民币双换算展示。
+2. 免额外 SDK 依赖，自动通过 Azure REST API 获取 VM 公网 IP 地址。
+3. 订阅级 Credit/Cost 缓存 (credit_cache)，多 VM 场景下防 429 限流。
+4. 查询 VM 状态 / 规格 / Region / 当月出站流量及额度占比。
+5. 联动 azure_monitor_state.json，直观展示是否处于止损熔断保护状态。
+6. 支持 paused / disabled 停机忽略开关。
+7. API 严格超时控制 + 3 次阶梯重试 + Linux 并发锁 + 日志按天轮转。
 """
 
 import json
@@ -41,7 +37,7 @@ warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================
-# 网络兼容
+# 网络兼容 (青龙 Docker 环境 IPv4 优先与 SNI)
 # ============================================================
 
 _orig_getaddrinfo = socket.getaddrinfo
@@ -124,6 +120,35 @@ def load_state():
 
 
 # ============================================================
+# 汇率与格式化
+# ============================================================
+
+
+def get_usd_to_cny_rate():
+    """获取实时汇率 (USD/CNY)，失败则返回保底汇率 7.0"""
+    try:
+        url = "https://api.exchangerate-api.com/v4/latest/USD"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            rate = data.get("rates", {}).get("CNY")
+            if rate:
+                logger.info(f"成功获取实时汇率: 1 USD = {float(rate):.2f} CNY")
+                return float(rate)
+    except Exception as e:
+        logger.warning(f"获取实时汇率失败，将使用保底汇率 7.0。原因: {e}")
+    return 7.0
+
+
+def format_money(usd_amount, rate):
+    """统一货币格式化，输出美金和预估人民币"""
+    if usd_amount is None:
+        return "查询失败"
+    cny = usd_amount * rate
+    return f"${usd_amount:.2f} (预估¥{cny:.2f})"
+
+
+# ============================================================
 # 推送 / Markdown
 # ============================================================
 
@@ -141,10 +166,7 @@ def send_wxpush(wx_conf, title, content):
         return False
 
     try:
-        url = wx_conf.get(
-            "wxpush_api_url",
-            "https://push.hzz.cool/wxsend"
-        )
+        url = wx_conf.get("wxpush_api_url", "https://push.hzz.cool/wxsend")
         payload = {
             "title": title,
             "content": content,
@@ -171,7 +193,7 @@ def send_wxpush(wx_conf, title, content):
 
 
 # ============================================================
-# Azure API
+# Azure API 与资源查询
 # ============================================================
 
 
@@ -236,8 +258,7 @@ def azure_request(method, url, *, params=None, json_body=None, token=None,
         except Exception as e:
             last_error = e
             logger.warning(
-                f"Azure API {method} {url} 失败 "
-                f"(尝试 {attempt}/{retries}): {e}"
+                f"Azure API {method} {url} 失败 (尝试 {attempt}/{retries}): {e}"
             )
             if attempt < retries:
                 time.sleep(2 * attempt)
@@ -265,7 +286,39 @@ def get_vm_info(compute_client, user):
     return {
         "size": getattr(vm.hardware_profile, "vm_size", "N/A"),
         "location": getattr(vm, "location", "N/A"),
+        "vm_obj": vm,
     }
+
+
+def get_vm_public_ip(user, credential, vm_obj):
+    """通过 Azure REST API 获取 VM 公网 IP，无需额外安装 azure-mgmt-network"""
+    try:
+        if not getattr(vm_obj, "network_profile", None) or not vm_obj.network_profile.network_interfaces:
+            return "无网络接口"
+
+        token = get_token(credential)
+        nic_id = vm_obj.network_profile.network_interfaces[0].id
+        nic_url = f"{MANAGEMENT_ENDPOINT}{nic_id}?api-version=2023-11-01"
+        nic_data = azure_request("GET", nic_url, token=token, retries=2)
+
+        ip_configs = nic_data.get("properties", {}).get("ipConfigurations", [])
+        if not ip_configs:
+            return "无网卡配置"
+
+        pip_info = ip_configs[0].get("properties", {}).get("publicIPAddress")
+        if not pip_info or not pip_info.get("id"):
+            private_ip = ip_configs[0].get("properties", {}).get("privateIPAddress", "")
+            return f"内网:{private_ip}" if private_ip else "无公网IP"
+
+        pip_id = pip_info["id"]
+        pip_url = f"{MANAGEMENT_ENDPOINT}{pip_id}?api-version=2023-11-01"
+        pip_data = azure_request("GET", pip_url, token=token, retries=2)
+
+        ip_address = pip_data.get("properties", {}).get("ipAddress")
+        return ip_address if ip_address else "无公网IP"
+    except Exception as e:
+        logger.warning(f"[{user.get('name')}] 获取公网 IP 异常: {e}")
+        return "查询失败"
 
 
 def get_vm_resource_id(user):
@@ -411,7 +464,7 @@ def get_credit_usage(user, credential):
 
 
 # ============================================================
-# 超时 / 锁
+# 超时与并发锁
 # ============================================================
 
 
@@ -459,14 +512,16 @@ def main():
             logger.info("config.json 中没有 Azure 配置，任务结束。")
             return
 
+        current_rate = get_usd_to_cny_rate()
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         success_count = 0
         fail_count = 0
         report_lines = []
+        credit_cache = {}  # 缓存同订阅同周期的 Cost，避免多 VM 产生重复请求
 
         header = (
             "📊 [Azure Student - 每日财报]\n"
-            f"📅 日期: {today}\n"
+            f"📅 日期: {today} (实时汇率: {current_rate:.2f})\n"
             f"✅ 成功机器：{{success}}，❌ 失败机器：{{fail}}\n"
             "--------------------------------\n"
         )
@@ -489,40 +544,31 @@ def main():
 
                 status = get_vm_status(compute_client, user)
                 info = get_vm_info(compute_client, user)
+                ip = get_vm_public_ip(user, credential, info["vm_obj"])
 
-                traffic_bytes = get_monthly_network_out(
-                    user,
-                    credential
-                )
+                traffic_bytes = get_monthly_network_out(user, credential)
                 traffic_gb = bytes_to_gb(traffic_bytes)
 
-                generic_free = float(
-                    user.get("generic_free_gb", 100)
-                )
-                student_free = float(
-                    user.get("student_free_gb", 15)
-                )
-                traffic_limit = float(
-                    user.get("traffic_limit", 110)
-                )
+                generic_free = float(user.get("generic_free_gb", 100))
+                student_free = float(user.get("student_free_gb", 15))
+                traffic_limit = float(user.get("traffic_limit", 110))
+                credit_limit = float(user.get("credit_limit", 100))
 
-                credit_limit = float(
-                    user.get("credit_limit", 100)
-                )
+                # 复用订阅级 Credit 缓存
+                sub_key = f"{user['subscription_id'].strip()}::{user.get('credit_start_date', '').strip()}"
+                if sub_key in credit_cache:
+                    credit_used, credit_error = credit_cache[sub_key]
+                else:
+                    credit_used = None
+                    credit_error = None
+                    try:
+                        credit_used = get_credit_usage(user, credential)
+                    except Exception as e:
+                        credit_error = e
+                        logger.error(f"[{name}] Cost 查询失败: {e}")
+                    credit_cache[sub_key] = (credit_used, credit_error)
 
-                credit_used = None
-                credit_error = None
-                try:
-                    credit_used = get_credit_usage(
-                        user,
-                        credential
-                    )
-                except Exception as e:
-                    credit_error = e
-                    logger.error(
-                        f"[{name}] Cost 查询失败: {e}"
-                    )
-
+                # 保护状态识别
                 key = (
                     f"{user.get('subscription_id', '').strip()}::"
                     f"{user.get('resource_group', '').strip()}::"
@@ -532,7 +578,7 @@ def main():
                 guarded = guard.get("deallocated_by_guard", False)
                 guard_reason = guard.get("guard_reason")
 
-                # 状态图标
+                # 图标展示
                 if status == "running":
                     run_icon = "🟢"
                 elif status == "deallocated":
@@ -542,56 +588,62 @@ def main():
                 else:
                     run_icon = "❓"
 
-                # 流量评价
+                # 流量计算与评价
+                percent = (traffic_gb / traffic_limit) * 100 if traffic_limit > 0 else 0
                 if traffic_gb >= traffic_limit:
-                    traffic_status = "🚨 已达到自动止损阈值"
+                    traffic_status = "🚨 已触发自动止损"
                 elif traffic_gb >= generic_free:
-                    traffic_status = "⚠️ 已超过 100GB 通用免费额度"
+                    traffic_status = "⚠️ 已超 100GB 通用免费额度"
                 else:
-                    traffic_status = "✅ 低于 100GB 通用免费额度"
+                    traffic_status = "✅ 免费额度内安全"
 
-                # Credit 评价
+                # Credit 评价与双币种换算
                 if credit_error is not None:
                     credit_status = "❓ 查询失败"
                     credit_text = "查询失败"
+                    total_credit_text = format_money(credit_limit, current_rate)
                     remaining_text = "查询失败"
                 else:
                     remaining = max(credit_limit - credit_used, 0)
                     if credit_used >= credit_limit:
-                        credit_status = "🚨 已达到保护上限"
+                        credit_status = "🚨 已达保护上限"
                     elif credit_used >= float(user.get("credit_emergency", 95)):
-                        credit_status = "🔴 接近 $100 上限"
+                        credit_status = "🔴 极高 (接近上限)"
                     elif credit_used >= float(user.get("credit_warning", 80)):
-                        credit_status = "⚠️ Credit 使用较高"
+                        credit_status = "⚠️ 较高预警"
                     else:
-                        credit_status = "✅ Credit 正常"
-                    credit_text = f"${credit_used:.2f}"
-                    remaining_text = f"${remaining:.2f}"
+                        credit_status = "✅ 消耗正常"
+
+                    credit_text = format_money(credit_used, current_rate)
+                    total_credit_text = format_money(credit_limit, current_rate)
+                    remaining_text = format_money(remaining, current_rate)
 
                 if guarded:
                     if guard_reason == "traffic":
-                        guard_status = "🚨 流量熔断状态"
+                        guard_status = "🚨 流量熔断保护中"
                     elif guard_reason == "credit":
-                        guard_status = "🚨 Credit 熔断状态"
+                        guard_status = "🚨 Credit 熔断保护中"
                     else:
                         guard_status = "🚨 自动保护状态"
                 else:
-                    guard_status = "✅ 未处于自动保护状态"
+                    guard_status = "✅ 监控正常运行中"
 
+                # 拼装单机器日报卡片
                 report_lines.append(
                     f"👤 *{sanitize_markdown(name)}* ({sanitize_markdown(info['size'])})\n"
                     f"   🖥️ 状态: {run_icon} {sanitize_markdown(status)}\n"
+                    f"   🌐 IP: `{ip}`\n"
                     f"   📍 Region: {sanitize_markdown(info['location'])}\n"
-                    f"   🌐 本月出站: {traffic_gb:.2f} GB\n"
-                    f"      ├─ 通用免费额度: {generic_free:.0f} GB/月\n"
-                    f"      ├─ Student 免费额度: {student_free:.0f} GB/月\n"
-                    f"      ├─ 自动止损阈值: {traffic_limit:.0f} GB\n"
+                    f"   📉 本月出站: {traffic_gb:.2f} GB ({percent:.1f}%)\n"
+                    f"      ├─ 通用额度: {generic_free:.0f} GB/月\n"
+                    f"      ├─ Student 额度: {student_free:.0f} GB/月\n"
+                    f"      ├─ 止损阈值: {traffic_limit:.0f} GB\n"
                     f"      └─ 评价: {traffic_status}\n"
                     f"   💰 Student Credit: {credit_text}\n"
-                    f"      ├─ 总额度: ${credit_limit:.2f}\n"
+                    f"      ├─ 总额度: {total_credit_text}\n"
                     f"      ├─ 剩余估算: {remaining_text}\n"
                     f"      └─ 评价: {credit_status}\n"
-                    f"   🛡️ 自动保护: {guard_status}\n"
+                    f"   🛡️ 止损防护: {guard_status}\n"
                 )
 
                 success_count += 1
@@ -599,44 +651,25 @@ def main():
 
             except Exception as e:
                 fail_count += 1
-                report_lines.append(
-                    f"❌ *{sanitize_markdown(name)}* Error: "
-                    f"{sanitize_markdown(e)}\n"
-                )
-                logger.exception(
-                    f"处理 Azure 用户 {name} 时出错"
-                )
+                err_msg = f"❌ *{sanitize_markdown(name)}* Error: {sanitize_markdown(str(e))}\n"
+                report_lines.append(err_msg)
+                logger.exception(f"处理 Azure 用户 {name} 时出错")
 
         final_summary = (
-            header.format(
-                success=success_count,
-                fail=fail_count
-            )
+            header.format(success=success_count, fail=fail_count)
             + "\n".join(report_lines)
             + "--------------------------------\n"
-            + "⚠️ 说明：Cost Management 数据存在刷新延迟，"
-              "Student Credit 剩余额度请以 Azure Sponsorships 为最终依据。"
+            + "⚠️ 说明：Cost Management 存在刷新延迟，最终余额请以 Azure Sponsorships 官网为准。"
         )
 
-        title = (
-            f"Azure 日报: 成功{success_count}, 失败{fail_count}"
-        )
+        push_title = f"Azure 日报: 成功{success_count}, 失败{fail_count}"
+        send_wxpush(wx_conf, push_title, final_summary)
 
-        send_wxpush(
-            wx_conf,
-            title,
-            final_summary
-        )
-
-        logger.info(
-            "=== 本次 Azure 日报结束 ===\n" + final_summary
-        )
+        logger.info("=== 本次 Azure 日报结束 ===\n" + final_summary)
         print(final_summary)
 
     except AzureReportTimeout:
-        logger.error(
-            f"Azure 日报执行超过 {REPORT_TIMEOUT}s，已强制终止。"
-        )
+        logger.error(f"Azure 日报执行超过 {REPORT_TIMEOUT}s，已强制终止。")
         raise
     finally:
         if hasattr(signal, "SIGALRM"):
