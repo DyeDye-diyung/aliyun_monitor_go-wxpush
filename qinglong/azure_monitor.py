@@ -1,16 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Azure for Students VM 流量 / Credit 自动监控 (增强版)
-
-特性：
-1. 每分钟检查 VM 状态与当月 Network Out Total 出站流量。
-2. 流量超标达到阈值后执行 Deallocate 止损（释放公网 IP 与运行费）。
-3. “监控失明”守护：连续巡检失败达 3 次立即发送紧急告警，防止凭证失效无感知。
-4. 告警信息自动附带最新的 Student Credit 财务消耗与剩余估算。
-5. 自动月初恢复：上月因流量超标熔断的 VM，在新月份首巡检时自动开机。
-6. Anti-OOS 开机保护：开机后原地轮询 120 秒确认 Running；连续 3 次失败后降频为 30 分钟重试。
-7. 智能防刷：普通异常 1 小时冷却，流量止损提醒 24 小时冷却。
-8. 进程锁 (fcntl) + 单实例 SIGALRM 硬超时防护，保障青龙任务绝不挂起卡死。
+Azure for Students VM 流量 / Credit 自动监控 (修复货币自适应换算)
 """
 
 import json
@@ -105,7 +95,7 @@ if not logger.handlers:
     logger.addHandler(console)
 
 # ============================================================
-# 配置 / 状态
+# 配置 / 状态 / 汇率
 # ============================================================
 
 
@@ -142,6 +132,19 @@ def save_state(state):
             pass
 
 
+def get_usd_to_cny_rate():
+    try:
+        url = "https://api.exchangerate-api.com/v4/latest/USD"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            rate = res.json().get("rates", {}).get("CNY")
+            if rate:
+                return float(rate)
+    except Exception:
+        pass
+    return 7.0
+
+
 def resource_key(user):
     return (
         f"{user.get('subscription_id', '').strip()}::"
@@ -160,7 +163,6 @@ def mark_notified(state, key, event_key):
 
 
 def get_credit_summary_line(user, state):
-    """从状态中提取最新的 Credit 统计行，便于拼接在告警消息中"""
     key = resource_key(user)
     item = state.get(key, {})
     used = item.get("last_credit_used")
@@ -465,7 +467,7 @@ def get_credit_usage(user, credential):
     rows = properties.get("rows", [])
 
     if not rows:
-        return 0.0
+        return 0.0, "USD"
 
     names = [c.get("name", "") for c in columns]
     index = None
@@ -481,6 +483,7 @@ def get_credit_usage(user, credential):
         if len(row) > index and row[index] is not None:
             total += float(row[index])
 
+    currency = "USD"
     currency_index = names.index("Currency") if "Currency" in names else None
     if currency_index is not None:
         currencies = {
@@ -490,12 +493,10 @@ def get_credit_usage(user, credential):
         }
         if len(currencies) > 1:
             raise RuntimeError(f"Cost API 返回多个货币单位: {currencies}")
-        if currencies and next(iter(currencies)) != "USD":
-            raise RuntimeError(
-                f"Cost API 返回货币为 {next(iter(currencies))}，当前要求 USD。"
-            )
+        if currencies:
+            currency = next(iter(currencies))
 
-    return total
+    return total, currency
 
 
 # ============================================================
@@ -504,7 +505,6 @@ def get_credit_usage(user, credential):
 
 
 def auto_restore_if_needed(user, compute_client, state, wx_conf):
-    """仅自动恢复由本监控因“流量熔断”导致的 Deallocate 机器"""
     key = resource_key(user)
     item = state.get(key, {})
 
@@ -637,23 +637,27 @@ def check_and_act(user, wx_conf, state):
     if "check_failures" in item:
         item.pop("check_failures", None)
 
-    # 4. 定期查询 Student Credit (默认每小时一次)
+    # 4. 定期查询 Student Credit (默认每小时一次，自适应汇率换算)
     last_cost_check = item.get("last_cost_check_ts", 0)
     cost_check_interval = int(user.get("cost_check_interval", 3600))
     if time.time() - last_cost_check >= cost_check_interval:
         item["last_cost_check_ts"] = time.time()
         try:
-            credit_used = get_credit_usage(user, credential)
+            raw_cost, cur = get_credit_usage(user, credential)
+            current_rate = get_usd_to_cny_rate()
+            if cur == "CNY":
+                credit_used = raw_cost / current_rate
+                logger.info(f"[{name}] Cost API 返回 ¥{raw_cost:.2f} CNY，已折算为 ${credit_used:.2f} USD")
+            else:
+                credit_used = raw_cost
+                logger.info(f"[{name}] Cost API 返回 ${credit_used:.2f} USD")
+
             credit_limit = float(user.get("credit_limit", 100))
             credit_warning = float(user.get("credit_warning", 80))
             credit_emergency = float(user.get("credit_emergency", 95))
 
             item["last_credit_used"] = credit_used
             save_state(state)
-
-            logger.info(
-                f"[{name}] Student Credit 累计使用 ${credit_used:.2f} / ${credit_limit:.2f}"
-            )
 
             if credit_used >= credit_limit and status == "running":
                 logger.warning(f"[{name}] Credit 达到保护上限，执行 Deallocate。")
@@ -785,7 +789,6 @@ def timeout_handler(signum, frame):
 
 def check_with_timeout(user, wx_conf, state):
     name = user.get("name", user.get("vm_name", "Azure"))
-    key = resource_key(user)
 
     if not hasattr(signal, "SIGALRM"):
         try:
@@ -808,7 +811,6 @@ def check_with_timeout(user, wx_conf, state):
 
 
 def handle_check_exception(user, wx_conf, state, error):
-    """统一捕获巡检失败，维护 check_failures 计数并在失明时报警"""
     name = user.get("name", user.get("vm_name", "Azure"))
     key = resource_key(user)
     logger.error(f"[{name}] 巡检异常: {error}")
