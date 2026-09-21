@@ -1,21 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Azure for Students VM 流量 / Credit 自动监控
+Azure for Students VM 流量 / Credit 自动监控 (增强版)
 
-与原项目 monitor.py 完全独立，不读取/修改阿里云 users 配置。
-
-核心功能：
-1. 每分钟检查 Azure VM 状态与当月 Network Out Total。
-2. 流量达到 traffic_limit 后执行 Deallocate 止损。
-3. 上个月因“流量熔断”而 Deallocate 的 VM，在新月份首次巡检时自动恢复。
-4. VM 启动后原地轮询，确认真实进入 running 才发送恢复成功通知。
-5. Azure API 请求带连接/读取超时和阶梯重试。
-6. 连续启动失败达到阈值后进入冷却期，避免资源不足时高频重试。
-7. 普通异常 / 流量超限通知带冷却，避免 Go-WXPush 推送轰炸。
-8. 单个 Azure 账号巡检带 SIGALRM 硬超时，避免青龙任务长期卡死。
-9. 使用文件锁防止 cron 并发堆积。
-10. Linux 青龙 Docker 环境的 SNI/IPv4 兼容处理。
-11. 日志按天轮转，保留 7 天。
+特性：
+1. 每分钟检查 VM 状态与当月 Network Out Total 出站流量。
+2. 流量超标达到阈值后执行 Deallocate 止损（释放公网 IP 与运行费）。
+3. “监控失明”守护：连续巡检失败达 3 次立即发送紧急告警，防止凭证失效无感知。
+4. 告警信息自动附带最新的 Student Credit 财务消耗与剩余估算。
+5. 自动月初恢复：上月因流量超标熔断的 VM，在新月份首巡检时自动开机。
+6. Anti-OOS 开机保护：开机后原地轮询 120 秒确认 Running；连续 3 次失败后降频为 30 分钟重试。
+7. 智能防刷：普通异常 1 小时冷却，流量止损提醒 24 小时冷却。
+8. 进程锁 (fcntl) + 单实例 SIGALRM 硬超时防护，保障青龙任务绝不挂起卡死。
 """
 
 import json
@@ -26,7 +21,7 @@ import socket
 import sys
 import time
 import warnings
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 
 import requests
@@ -35,7 +30,7 @@ from azure.identity import ClientSecretCredential
 from azure.mgmt.compute import ComputeManagementClient
 
 try:
-    import fcntl  # Linux 文件锁
+    import fcntl
 except ImportError:
     fcntl = None
 
@@ -58,7 +53,7 @@ def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = _getaddrinfo_ipv4_only
 
 # ============================================================
-# 全局路径
+# 全局路径与常量
 # ============================================================
 
 CURR_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,18 +62,16 @@ LOG_FILE = os.path.join(CURR_DIR, "azure_monitor.log")
 STATE_FILE = os.path.join(CURR_DIR, "azure_monitor_state.json")
 LOCK_FILE = os.path.join(CURR_DIR, "azure_monitor.lock")
 
-# ============================================================
-# 配置常量
-# ============================================================
+NOTIFY_COOLDOWN = 3600              # 普通异常通知冷却：1 小时
+OVERLIMIT_COOLDOWN = 86400          # 流量超标通知冷却：24 小时
+START_WAIT_TIMEOUT = 120            # 开机后最多轮询等待 120 秒
+START_POLL_INTERVAL = 10            # 每 10 秒查询一次开机状态
+USER_CHECK_TIMEOUT = 150            # 单个 Azure 账号巡检硬超时：150 秒
+MAX_START_FAILURES = 3              # 连续开机失败达到 3 次进入防爆破冷却
+RESOURCE_RETRY_COOLDOWN = 1800      # 资源不足冷却时间：30 分钟
+CHECK_FAILURE_ALERT_THRESHOLD = 3   # 连续巡检失败达 3 次发送"监控失明"告警
 
-NOTIFY_COOLDOWN = 3600           # 普通异常 1 小时
-OVERLIMIT_COOLDOWN = 86400       # 流量超限 24 小时
-START_WAIT_TIMEOUT = 120         # Azure start 后最多等待 120 秒
-START_POLL_INTERVAL = 10         # 每 10 秒查询一次状态
-USER_CHECK_TIMEOUT = 150         # 单个 Azure 账号最多检查 150 秒
-MAX_START_FAILURES = 3           # 连续启动失败达到 3 次进入冷却
-RESOURCE_RETRY_COOLDOWN = 1800   # 冷却 30 分钟
-API_RETRIES = 3                  # 一般 API 最多 3 次
+API_RETRIES = 3
 API_CONNECT_TIMEOUT = 5
 API_READ_TIMEOUT = 15
 METRIC_READ_TIMEOUT = 30
@@ -166,6 +159,18 @@ def mark_notified(state, key, event_key):
     state.setdefault(key, {}).setdefault("notifications", {})[event_key] = time.time()
 
 
+def get_credit_summary_line(user, state):
+    """从状态中提取最新的 Credit 统计行，便于拼接在告警消息中"""
+    key = resource_key(user)
+    item = state.get(key, {})
+    used = item.get("last_credit_used")
+    if used is not None:
+        limit = float(user.get("credit_limit", 100))
+        rem = max(limit - used, 0.0)
+        return f"\n💳 Credit 已消耗: ${used:.2f} (剩余约 ${rem:.2f})"
+    return ""
+
+
 # ============================================================
 # Markdown / 推送
 # ============================================================
@@ -184,10 +189,7 @@ def send_wxpush(wx_conf, title, content):
         return False
 
     try:
-        url = wx_conf.get(
-            "wxpush_api_url",
-            "https://push.hzz.cool/wxsend"
-        )
+        url = wx_conf.get("wxpush_api_url", "https://push.hzz.cool/wxsend")
         payload = {
             "title": title,
             "content": content,
@@ -279,50 +281,30 @@ def azure_request(method, url, *, params=None, json_body=None, token=None,
         except Exception as e:
             last_error = e
             logger.warning(
-                f"Azure API {method} {url} 失败 "
-                f"(尝试 {attempt}/{retries}): {e}"
+                f"Azure API {method} {url} 失败 (尝试 {attempt}/{retries}): {e}"
             )
             if attempt < retries:
                 time.sleep(2 * attempt)
 
-    logger.error(
-        f"Azure API {method} {url} 最终失败，已重试 {retries} 次"
-    )
+    logger.error(f"Azure API {method} {url} 最终失败，已重试 {retries} 次")
     raise last_error
 
 
 # ============================================================
-# VM
+# VM 控制与轮询
 # ============================================================
 
 
 def get_vm_status(compute_client, user):
-    resource_group = user["resource_group"].strip()
-    vm_name = user["vm_name"].strip()
-
     view = compute_client.virtual_machines.instance_view(
-        resource_group,
-        vm_name,
+        user["resource_group"].strip(),
+        user["vm_name"].strip(),
     )
-
     for status in view.statuses:
         code = getattr(status, "code", "") or ""
         if code.startswith("PowerState/"):
             return code.split("/", 1)[1].lower()
-
     return "unknown"
-
-
-def get_vm_info(compute_client, user):
-    vm = compute_client.virtual_machines.get(
-        user["resource_group"].strip(),
-        user["vm_name"].strip(),
-    )
-    return {
-        "size": getattr(vm.hardware_profile, "vm_size", "N/A"),
-        "location": getattr(vm, "location", "N/A"),
-        "id": getattr(vm, "id", ""),
-    }
 
 
 def start_vm(compute_client, user):
@@ -339,7 +321,7 @@ def start_vm(compute_client, user):
 def deallocate_vm(compute_client, user):
     resource_group = user["resource_group"].strip()
     vm_name = user["vm_name"].strip()
-    logger.warning(f"[{user['name']}] 执行 Azure VM Deallocate...")
+    logger.warning(f"[{user['name']}] 执行 Azure VM Deallocate (解除分配)...")
     operation = compute_client.virtual_machines.begin_deallocate(
         resource_group,
         vm_name,
@@ -364,7 +346,7 @@ def wait_for_running(compute_client, user):
 
 
 # ============================================================
-# Metrics
+# Metrics & Cost
 # ============================================================
 
 
@@ -379,13 +361,10 @@ def month_key(dt=None):
 
 
 def get_vm_resource_id(user):
-    subscription_id = user["subscription_id"].strip()
-    resource_group = user["resource_group"].strip()
-    vm_name = user["vm_name"].strip()
     return (
-        f"/subscriptions/{subscription_id}"
-        f"/resourceGroups/{resource_group}"
-        f"/providers/Microsoft.Compute/virtualMachines/{vm_name}"
+        f"/subscriptions/{user['subscription_id'].strip()}"
+        f"/resourceGroups/{user['resource_group'].strip()}"
+        f"/providers/Microsoft.Compute/virtualMachines/{user['vm_name'].strip()}"
     )
 
 
@@ -399,12 +378,9 @@ def get_monthly_network_out(user, credential):
         f"{start.strftime('%Y-%m-%dT%H:%M:%SZ')}/"
         f"{end.strftime('%Y-%m-%dT%H:%M:%SZ')}"
     )
-
     url = (
-        f"{MANAGEMENT_ENDPOINT}"
-        f"{resource_id}/providers/microsoft.insights/metrics"
+        f"{MANAGEMENT_ENDPOINT}{resource_id}/providers/microsoft.insights/metrics"
     )
-
     params = {
         "api-version": METRICS_API_VERSION,
         "metricnames": "Network Out Total",
@@ -429,17 +405,11 @@ def get_monthly_network_out(user, credential):
                 value = point.get("total")
                 if value is not None:
                     total_bytes += float(value)
-
     return total_bytes
 
 
 def bytes_to_gb(value):
     return value / (1024 ** 3)
-
-
-# ============================================================
-# Cost Management
-# ============================================================
 
 
 def parse_date(value):
@@ -457,10 +427,7 @@ def get_credit_usage(user, credential):
     token = get_token(credential)
     subscription_id = user["subscription_id"].strip()
     scope = f"/subscriptions/{subscription_id}"
-    url = (
-        f"{MANAGEMENT_ENDPOINT}{scope}"
-        f"/providers/Microsoft.CostManagement/query"
-    )
+    url = f"{MANAGEMENT_ENDPOINT}{scope}/providers/Microsoft.CostManagement/query"
 
     start = get_credit_start_date(user)
     end = datetime.now(timezone.utc)
@@ -483,12 +450,10 @@ def get_credit_usage(user, credential):
         },
     }
 
-    params = {"api-version": COST_API_VERSION}
-
     data = azure_request(
         "POST",
         url,
-        params=params,
+        params={"api-version": COST_API_VERSION},
         json_body=body,
         token=token,
         retries=API_RETRIES,
@@ -516,8 +481,6 @@ def get_credit_usage(user, credential):
         if len(row) > index and row[index] is not None:
             total += float(row[index])
 
-    # 本配置默认按 USD 管理；如果 Cost API 返回的货币不是 USD，
-    # 这里不做汇率转换，避免错误地把非 USD 原值当作 USD。
     currency_index = names.index("Currency") if "Currency" in names else None
     if currency_index is not None:
         currencies = {
@@ -529,23 +492,19 @@ def get_credit_usage(user, credential):
             raise RuntimeError(f"Cost API 返回多个货币单位: {currencies}")
         if currencies and next(iter(currencies)) != "USD":
             raise RuntimeError(
-                f"Cost API 返回货币为 {next(iter(currencies))}，"
-                f"当前 Student Credit 配置要求 USD。"
+                f"Cost API 返回货币为 {next(iter(currencies))}，当前要求 USD。"
             )
 
     return total
 
 
 # ============================================================
-# 自动恢复
+# 月初自动恢复
 # ============================================================
 
 
 def auto_restore_if_needed(user, compute_client, state, wx_conf):
-    """
-    只恢复“上个月由本程序因流量触发的熔断”。
-    Credit 熔断不会因为自然月切换而自动恢复。
-    """
+    """仅自动恢复由本监控因“流量熔断”导致的 Deallocate 机器"""
     key = resource_key(user)
     item = state.get(key, {})
 
@@ -559,13 +518,10 @@ def auto_restore_if_needed(user, compute_client, state, wx_conf):
     if not guarded_month or guarded_month == current_month:
         return
 
-    # 防止同一个新月份重复执行“月初恢复”
     if item.get("last_restore_month") == current_month:
         return
 
     status = get_vm_status(compute_client, user)
-
-    # 如果用户已经手动启动，不再重复 start。
     if status == "running":
         item["deallocated_by_guard"] = False
         item["last_restore_month"] = current_month
@@ -573,23 +529,17 @@ def auto_restore_if_needed(user, compute_client, state, wx_conf):
         return
 
     if status not in ("deallocated", "stopped"):
-        logger.warning(
-            f"[{user['name']}] 月初恢复时状态为 {status}，跳过自动启动。"
-        )
+        logger.warning(f"[{user['name']}] 月初恢复时状态为 {status}，跳过自动启动。")
         return
 
     failures = item.get("start_failures", 0)
     if failures >= MAX_START_FAILURES:
         last_retry = item.get("last_retry_ts", 0)
         if time.time() - last_retry < RESOURCE_RETRY_COOLDOWN:
-            logger.info(f"[{user['name']}] 月初自动恢复仍处于资源重试冷却期，跳过。")
+            logger.info(f"[{user['name']}] 月初恢复处于资源不足冷却期中，本轮跳过。")
             return
 
-    logger.warning(
-        f"[{user['name']}] 检测到上月流量熔断，"
-        f"进入新月份 {current_month}，准备自动恢复。"
-    )
-
+    logger.warning(f"[{user['name']}] 检测到上月流量熔断，进入新月份 {current_month}，执行自动恢复...")
     item["last_retry_ts"] = time.time()
     state[key] = item
 
@@ -607,11 +557,11 @@ def auto_restore_if_needed(user, compute_client, state, wx_conf):
             save_state(state)
 
             if can_notify(state, key, "auto_restore"):
+                cred_line = get_credit_summary_line(user, state)
                 content = (
-                    f"✅ [{sanitize_markdown(user['name'])}] Azure 月初自动恢复成功。\n"
-                    f"原因：上月流量熔断\n"
-                    f"当前月份：{current_month}\n"
-                    f"VM 已确认进入 Running。"
+                    f"✅ [{sanitize_markdown(user['name'])}] Azure 月初自动恢复成功！\n"
+                    f"原因：跨入新自然月 ({current_month})，流量额度已重置\n"
+                    f"状态：已确认进入 Running 运行中{cred_line}"
                 )
                 if send_wxpush(wx_conf, "Azure 月初自动恢复", content):
                     mark_notified(state, key, "auto_restore")
@@ -620,7 +570,7 @@ def auto_restore_if_needed(user, compute_client, state, wx_conf):
             item["start_failures"] = failures + 1
             state[key] = item
             save_state(state)
-            logger.warning(f"[{user['name']}] 月初自动恢复：Start 请求完成，但未确认 Running。")
+            logger.warning(f"[{user['name']}] 月初自动恢复：Start 指令完成，但在限时内未确认 Running。")
 
     except Exception as e:
         item["start_failures"] = failures + 1
@@ -630,7 +580,7 @@ def auto_restore_if_needed(user, compute_client, state, wx_conf):
         if can_notify(state, key, "restore_error"):
             content = (
                 f"⚠️ [{sanitize_markdown(user['name'])}] Azure 月初自动恢复失败。\n"
-                f"错误：{sanitize_markdown(e)}"
+                f"错误：{sanitize_markdown(str(e))}"
             )
             if send_wxpush(wx_conf, "Azure 月初恢复失败", content):
                 mark_notified(state, key, "restore_error")
@@ -665,28 +615,29 @@ def check_and_act(user, wx_conf, state):
     credential = build_credential(user)
     compute_client = build_compute_client(user, credential)
 
-    # 1. 新月自动恢复
+    # 1. 尝试月初自动恢复
     auto_restore_if_needed(user, compute_client, state, wx_conf)
 
-    # 2. 查询状态
+    # 2. 查询状态与流量
     status = get_vm_status(compute_client, user)
     if status == "unknown":
         logger.warning(f"❓[{name}] Azure VM 状态未知")
         return
 
-    # 3. 查询当月流量
     traffic_bytes = get_monthly_network_out(user, credential)
     traffic_gb = bytes_to_gb(traffic_bytes)
     traffic_limit = float(user.get("traffic_limit", 110))
 
     logger.info(
-        f"[{name}] Network Out {traffic_gb:.2f} GB / {traffic_limit:.2f} GB，"
-        f"VM={status}"
+        f"[{name}] Network Out {traffic_gb:.2f} GB / {traffic_limit:.2f} GB，VM={status}"
     )
 
-    # 4. Cost 不需要像流量一样每分钟严格监控，默认每小时检查一次。
-    #    仍然保留在 monitor 中作为最后一道自动保护；日报会每天强制查询。
+    # 3. 成功获取数据，重置连续巡检失败计数（消除“监控失明”预警）
     item = state.setdefault(key, {})
+    if "check_failures" in item:
+        item.pop("check_failures", None)
+
+    # 4. 定期查询 Student Credit (默认每小时一次)
     last_cost_check = item.get("last_cost_check_ts", 0)
     cost_check_interval = int(user.get("cost_check_interval", 3600))
     if time.time() - last_cost_check >= cost_check_interval:
@@ -701,14 +652,11 @@ def check_and_act(user, wx_conf, state):
             save_state(state)
 
             logger.info(
-                f"[{name}] Student Credit 累计使用 ${credit_used:.2f} / "
-                f"${credit_limit:.2f}"
+                f"[{name}] Student Credit 累计使用 ${credit_used:.2f} / ${credit_limit:.2f}"
             )
 
             if credit_used >= credit_limit and status == "running":
-                logger.warning(
-                    f"[{name}] Credit 达到保护上限，执行 Deallocate。"
-                )
+                logger.warning(f"[{name}] Credit 达到保护上限，执行 Deallocate。")
                 deallocate_vm(compute_client, user)
                 item.update({
                     "deallocated_by_guard": True,
@@ -720,11 +668,11 @@ def check_and_act(user, wx_conf, state):
 
                 if can_notify(state, key, "credit_stop", OVERLIMIT_COOLDOWN):
                     content = (
-                        f"🚨 [{sanitize_markdown(name)}] Azure Student Credit 已达到保护上限。\n"
+                        f"🚨 [{sanitize_markdown(name)}] Azure Student Credit 已达到保护上限！\n"
                         f"累计 Cost：${credit_used:.2f}\n"
                         f"保护上限：${credit_limit:.2f}\n"
-                        f"已执行 VM Deallocate。\n"
-                        f"⚠️ Cost Management 数据可能存在延迟，请同步检查 Azure Sponsorships。"
+                        f"动作：已执行 VM Deallocate (解除分配停止计费)。\n"
+                        f"⚠️ Cost Management 存在延迟，请同步确认 Azure Sponsorships。"
                     )
                     if send_wxpush(wx_conf, "Azure Credit 止损", content):
                         mark_notified(state, key, "credit_stop")
@@ -735,7 +683,7 @@ def check_and_act(user, wx_conf, state):
                 if send_wxpush(
                     wx_conf,
                     "Azure Credit 高位预警",
-                    f"⚠️ [{sanitize_markdown(name)}] Student Credit 已使用 ${credit_used:.2f}，接近 ${credit_limit:.2f} 上限。"
+                    f"⚠️ [{sanitize_markdown(name)}] Student Credit 已使用 ${credit_used:.2f}，接近 ${credit_limit:.2f} 保护线。"
                 ):
                     mark_notified(state, key, "credit_emergency")
                     save_state(state)
@@ -753,14 +701,13 @@ def check_and_act(user, wx_conf, state):
             if can_notify(state, key, "cost_query_error"):
                 content = (
                     f"⚠️ [{sanitize_markdown(name)}] Azure Cost Management 查询失败。\n"
-                    f"错误：{sanitize_markdown(e)}"
+                    f"错误：{sanitize_markdown(str(e))}"
                 )
                 if send_wxpush(wx_conf, "Azure Cost 查询异常", content):
                     mark_notified(state, key, "cost_query_error")
                     save_state(state)
 
-    # 5. 流量安全：只有“本程序流量熔断后”才允许自动恢复。
-    #    正常情况下，不会因为 VM 是 deallocated/stopped 就擅自启动。
+    # 5. 流量安全状态
     if traffic_gb < traffic_limit:
         item = state.setdefault(key, {})
         item.setdefault("start_failures", 0)
@@ -768,11 +715,11 @@ def check_and_act(user, wx_conf, state):
         save_state(state)
         return
 
-    # 5. 流量超标
+    # 6. 流量超标止损
+    cred_line = get_credit_summary_line(user, state)
     if status == "running":
         logger.warning(
-            f"[{name}] 流量超限，当前 {traffic_gb:.2f} GB >= {traffic_limit:.2f} GB，"
-            f"执行 Deallocate。"
+            f"[{name}] 流量超标 ({traffic_gb:.2f} GB >= {traffic_limit:.2f} GB)，执行 Deallocate..."
         )
         try:
             deallocate_vm(compute_client, user)
@@ -788,38 +735,35 @@ def check_and_act(user, wx_conf, state):
 
             if can_notify(state, key, "overlimit_stop", OVERLIMIT_COOLDOWN):
                 content = (
-                    f"🚨 [{sanitize_markdown(name)}] Azure 流量超限止损。\n"
-                    f"本月出站：{traffic_gb:.2f} GB\n"
-                    f"安全阈值：{traffic_limit:.2f} GB\n"
-                    f"已执行 VM Deallocate。"
+                    f"🚨 [{sanitize_markdown(name)}] Azure 出站流量超标！\n"
+                    f"当月流量：{traffic_gb:.2f} GB\n"
+                    f"止损阈值：{traffic_limit:.2f} GB\n"
+                    f"动作：已执行 VM Deallocate 关机熔断保护{cred_line}"
                 )
-                if send_wxpush(wx_conf, "Azure 流量超限止损", content):
+                if send_wxpush(wx_conf, "Azure 流量超标止损", content):
                     mark_notified(state, key, "overlimit_stop")
                     save_state(state)
         except Exception as e:
             logger.error(f"[{name}] Azure Deallocate 失败: {e}")
             if can_notify(state, key, "deallocate_error"):
                 content = (
-                    f"❌ [{sanitize_markdown(name)}] Azure 流量已超限，但 Deallocate 失败。\n"
-                    f"当前：{traffic_gb:.2f} GB\n"
-                    f"阈值：{traffic_limit:.2f} GB\n"
-                    f"错误：{sanitize_markdown(e)}"
+                    f"❌ [{sanitize_markdown(name)}] Azure 流量超标，但 Deallocate 失败！\n"
+                    f"当月流量：{traffic_gb:.2f} GB\n"
+                    f"错误：{sanitize_markdown(str(e))}\n"
+                    f"请立即手动前往 Portal 处理。"
                 )
                 if send_wxpush(wx_conf, "Azure 流量止损失败", content):
                     mark_notified(state, key, "deallocate_error")
                     save_state(state)
 
     else:
-        logger.warning(
-            f"🔴[{name}] Azure 流量已超限，VM 当前={status}"
-        )
+        logger.warning(f"🔴[{name}] Azure 流量超标，VM 处于 {status} 保护状态")
         if can_notify(state, key, "overlimit_remind", OVERLIMIT_COOLDOWN):
             content = (
-                f"⚠️ [{sanitize_markdown(name)}] Azure 本月流量已达到止损阈值。\n"
-                f"当前：{traffic_gb:.2f} GB\n"
-                f"阈值：{traffic_limit:.2f} GB\n"
-                f"VM 当前状态：{status}\n"
-                f"目前保持保护状态。"
+                f"⚠️ [{sanitize_markdown(name)}] Azure 流量熔断提醒。\n"
+                f"当月出站：{traffic_gb:.2f} GB (阈值: {traffic_limit:.2f} GB)\n"
+                f"VM 状态：{status}\n"
+                f"保持解除分配保护中，新月将自动恢复。{cred_line}"
             )
             if send_wxpush(wx_conf, "Azure 超限保护提醒", content):
                 mark_notified(state, key, "overlimit_remind")
@@ -827,7 +771,7 @@ def check_and_act(user, wx_conf, state):
 
 
 # ============================================================
-# 超时守护
+# 超时与连续失败失明监控
 # ============================================================
 
 
@@ -840,8 +784,14 @@ def timeout_handler(signum, frame):
 
 
 def check_with_timeout(user, wx_conf, state):
+    name = user.get("name", user.get("vm_name", "Azure"))
+    key = resource_key(user)
+
     if not hasattr(signal, "SIGALRM"):
-        check_and_act(user, wx_conf, state)
+        try:
+            check_and_act(user, wx_conf, state)
+        except Exception as e:
+            handle_check_exception(user, wx_conf, state, e)
         return
 
     signal.signal(signal.SIGALRM, timeout_handler)
@@ -849,12 +799,35 @@ def check_with_timeout(user, wx_conf, state):
     try:
         check_and_act(user, wx_conf, state)
     except AzureMonitorTimeout:
-        name = user.get("name", user.get("vm_name", "Azure"))
-        logger.error(
-            f"[{name}] Azure 巡检超时({USER_CHECK_TIMEOUT}s)，已强行跳过。"
-        )
+        logger.error(f"[{name}] Azure 巡检超时({USER_CHECK_TIMEOUT}s)，已强行中断本台机器。")
+        handle_check_exception(user, wx_conf, state, RuntimeError("巡检硬超时"))
+    except Exception as e:
+        handle_check_exception(user, wx_conf, state, e)
     finally:
         signal.alarm(0)
+
+
+def handle_check_exception(user, wx_conf, state, error):
+    """统一捕获巡检失败，维护 check_failures 计数并在失明时报警"""
+    name = user.get("name", user.get("vm_name", "Azure"))
+    key = resource_key(user)
+    logger.error(f"[{name}] 巡检异常: {error}")
+
+    item = state.setdefault(key, {})
+    failures = item.get("check_failures", 0) + 1
+    item["check_failures"] = failures
+    save_state(state)
+
+    if failures >= CHECK_FAILURE_ALERT_THRESHOLD and can_notify(state, key, "monitor_blind"):
+        content = (
+            f"🚨 [{sanitize_markdown(name)}] 监控失明告警！\n"
+            f"已连续 {failures} 次巡检失败。\n"
+            f"最近错误：{sanitize_markdown(str(error))}\n"
+            f"期间自动流量止损与保护已失效，请立即检查 Azure 凭证有效性。"
+        )
+        if send_wxpush(wx_conf, "Azure 监控失明告警", content):
+            mark_notified(state, key, "monitor_blind")
+            save_state(state)
 
 
 # ============================================================
@@ -902,7 +875,7 @@ def main():
         save_state(state)
 
     except Exception as e:
-        logger.exception(f"Azure monitor main failed: {e}")
+        logger.exception(f"Azure monitor main 遇到致命错误: {e}")
         raise
     finally:
         if hasattr(lock, "close"):
