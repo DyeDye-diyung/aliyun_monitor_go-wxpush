@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Azure for Students 每日报告 (修复货币自适应换算)
+Azure for Students 每日报告 (支持代理与直连双模式)
 """
 
 import json
@@ -88,7 +88,7 @@ if not logger.handlers:
 
 
 # ============================================================
-# Config / State
+# Config / State / 代理工具函数
 # ============================================================
 
 
@@ -110,16 +110,25 @@ def load_state():
         return {}
 
 
+def get_proxies(user):
+    """获取代理配置字典；未配置或为空时返回 None（直连）"""
+    proxy = user.get("proxy", "").strip() if isinstance(user, dict) else ""
+    if proxy:
+        return {"http": proxy, "https": proxy}
+    return None
+
+
 # ============================================================
 # 汇率与格式化
 # ============================================================
 
 
-def get_usd_to_cny_rate():
-    """获取实时汇率 (USD/CNY)，失败则返回保底汇率 7.0"""
+def get_usd_to_cny_rate(proxy=None):
+    """获取实时汇率 (USD/CNY)，支持代理，失败则返回保底汇率 7.0"""
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
         url = "https://api.exchangerate-api.com/v4/latest/USD"
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, timeout=5, proxies=proxies)
         if response.status_code == 200:
             data = response.json()
             rate = data.get("rates", {}).get("CNY")
@@ -189,17 +198,23 @@ def send_wxpush(wx_conf, title, content):
 
 
 def build_credential(user):
+    proxies = get_proxies(user)
+    kwargs = {"proxies": proxies} if proxies else {}
     return ClientSecretCredential(
         tenant_id=user["tenant_id"].strip(),
         client_id=user["client_id"].strip(),
         client_secret=user["client_secret"].strip(),
+        **kwargs
     )
 
 
 def build_compute_client(user, credential):
+    proxies = get_proxies(user)
+    kwargs = {"proxies": proxies} if proxies else {}
     return ComputeManagementClient(
         credential,
         user["subscription_id"].strip(),
+        **kwargs
     )
 
 
@@ -208,7 +223,7 @@ def get_token(credential):
 
 
 def azure_request(method, url, *, params=None, json_body=None, token=None,
-                  retries=API_RETRIES, timeout=None):
+                  retries=API_RETRIES, timeout=None, proxies=None):
     last_error = None
     timeout = timeout or (API_CONNECT_TIMEOUT, API_READ_TIMEOUT)
 
@@ -227,6 +242,7 @@ def azure_request(method, url, *, params=None, json_body=None, token=None,
                 json=json_body,
                 headers=headers,
                 timeout=timeout,
+                proxies=proxies,
             )
 
             if response.status_code in (429, 500, 502, 503, 504):
@@ -282,15 +298,16 @@ def get_vm_info(compute_client, user):
 
 
 def get_vm_public_ip(user, credential, vm_obj):
-    """通过 Azure REST API 获取 VM 公网 IP，无需额外安装 azure-mgmt-network"""
+    """通过 Azure REST API 获取 VM 公网 IP，支持代理"""
     try:
         if not getattr(vm_obj, "network_profile", None) or not vm_obj.network_profile.network_interfaces:
             return "无网络接口"
 
         token = get_token(credential)
+        proxies = get_proxies(user)
         nic_id = vm_obj.network_profile.network_interfaces[0].id
         nic_url = f"{MANAGEMENT_ENDPOINT}{nic_id}?api-version=2023-11-01"
-        nic_data = azure_request("GET", nic_url, token=token, retries=2)
+        nic_data = azure_request("GET", nic_url, token=token, retries=2, proxies=proxies)
 
         ip_configs = nic_data.get("properties", {}).get("ipConfigurations", [])
         if not ip_configs:
@@ -303,7 +320,7 @@ def get_vm_public_ip(user, credential, vm_obj):
 
         pip_id = pip_info["id"]
         pip_url = f"{MANAGEMENT_ENDPOINT}{pip_id}?api-version=2023-11-01"
-        pip_data = azure_request("GET", pip_url, token=token, retries=2)
+        pip_data = azure_request("GET", pip_url, token=token, retries=2, proxies=proxies)
 
         ip_address = pip_data.get("properties", {}).get("ipAddress")
         return ip_address if ip_address else "无公网IP"
@@ -327,6 +344,7 @@ def get_month_start_utc():
 
 def get_monthly_network_out(user, credential):
     token = get_token(credential)
+    proxies = get_proxies(user)
     resource_id = get_vm_resource_id(user)
     start = get_month_start_utc()
     end = datetime.now(timezone.utc)
@@ -353,6 +371,7 @@ def get_monthly_network_out(user, credential):
         token=token,
         retries=API_RETRIES,
         timeout=(API_CONNECT_TIMEOUT, METRIC_READ_TIMEOUT),
+        proxies=proxies,
     )
 
     total_bytes = 0.0
@@ -381,8 +400,9 @@ def get_credit_start_date(user):
 
 
 def get_credit_usage(user, credential):
-    """查询 Student Credit 周期累计成本，自适应支持 USD / CNY 返回"""
+    """查询 Student Credit 周期累计成本，自适应支持 USD / CNY 并支持代理"""
     token = get_token(credential)
+    proxies = get_proxies(user)
     subscription_id = user["subscription_id"].strip()
     url = (
         f"{MANAGEMENT_ENDPOINT}/subscriptions/{subscription_id}"
@@ -418,6 +438,7 @@ def get_credit_usage(user, credential):
         token=token,
         retries=API_RETRIES,
         timeout=(API_CONNECT_TIMEOUT, COST_READ_TIMEOUT),
+        proxies=proxies,
     )
 
     properties = data.get("properties", {})
@@ -438,7 +459,6 @@ def get_credit_usage(user, credential):
         if len(row) > index and row[index] is not None:
             total += float(row[index])
 
-    # 提取货币单位 (支持 USD 与 CNY 自适应)
     currency = "USD"
     currency_index = names.index("Currency") if "Currency" in names else None
     if currency_index is not None:
@@ -504,7 +524,10 @@ def main():
             logger.info("config.json 中没有 Azure 配置，任务结束。")
             return
 
-        current_rate = get_usd_to_cny_rate()
+        # 优先使用首个有效配置的代理来获取汇率，避免国内拉取汇率超时
+        default_proxy = next((u.get("proxy", "").strip() for u in azure_users if u.get("proxy")), None)
+        current_rate = get_usd_to_cny_rate(default_proxy)
+
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         success_count = 0
         fail_count = 0
