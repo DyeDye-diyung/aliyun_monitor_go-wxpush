@@ -10,7 +10,8 @@
 
 ## 1. 核心特性清单
 
-- **实时汇率双币种展示**：每日财报调用公共汇率接口，Student Credit 的总额度、已消耗额度、剩余估算额度均同时显示 USD 和预估 CNY。
+- **支持 HTTP / SOCKS 代理访问**：支持自定义代理地址（如内网混合代理 `http://192.168.31.6:7890`），彻底解决国内直连 Azure API 偶发超时与阻断问题，同时保留直连选项。
+- **实时汇率双币种展示**：每日财报调用公共汇率接口，Student Credit 的总额度、已消耗额度、剩余估算额度均同时显示 USD 和预估 CNY，并自适应中国区 Azure 账号返回的 `CNY` 计费币种。
 - **免装库公网 IP 侦测**：直接利用 Azure ARM REST API 穿透网卡与关联的公共 IP，无需额外安装 `azure-mgmt-network`，卡片即可完整显示公网 IP。
 - **订阅级 Cost 缓存（防 429）**：同一 Subscription 下配置多台 VM 时，单轮巡检只调用一次 Cost Management API，彻底避免触发 Azure API 速率限制。
 - **“监控失明”紧急告警**：若因 Secret 过期、权限篡改或网络故障导致连续 3 次巡检失败，自动触发微信告警，防止因监控挂起导致流量偷跑。
@@ -128,7 +129,7 @@ Azure 采用企业级 Service Principal（服务主体）鉴权，程序最终�
 
 ## 5. 配置文件 (`config.json`) 说明
 
-保持原有的 `wxpush` 和阿里云 `users` 配置不变，直接追加 `azure` 列表：
+保持原有的 `wxpush` 和阿里云 `users` 配置不变，在 `azure` 数组的机器对象中加入所需字段（支持配置代理）：
 
 ```json
 {
@@ -145,6 +146,8 @@ Azure 采用企业级 Service Principal（服务主体）鉴权，程序最终�
     "azure": [
         {
             "name": "Azure 学生机",
+            "proxy": "http://192.168.31.1:7890", // 可选代理，留空 "" 或不配该行即为直连模式
+
             "tenant_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
             "client_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
             "client_secret": "你的_CLIENT_SECRET_VALUE",
@@ -165,17 +168,3 @@ Azure 采用企业级 Service Principal（服务主体）鉴权，程序最终�
     ]
 }
 ```
-
----
-
-## 6. 青龙面板安装依赖
-
-在青龙面板的 **“依赖管理” → “Python3”** 添加（或在容器终端执行 `pip3 install`）：
-
-```
-azure-identity
-azure-mgmt-compute
-requests
-```
-
-*(注：由于公网 IP 与流量均采用 REST 直调，无需安装笨重的网络和监控专用 SDK。)*
