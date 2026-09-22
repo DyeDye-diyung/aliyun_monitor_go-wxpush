@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Azure for Students VM 流量 / Credit 自动监控 (修复货币自适应换算)
+Azure for Students VM 流量 / Credit 自动监控 (支持代理与直连双模式)
 """
 
 import json
@@ -95,7 +95,7 @@ if not logger.handlers:
     logger.addHandler(console)
 
 # ============================================================
-# 配置 / 状态 / 汇率
+# 配置 / 状态 / 代理 / 汇率
 # ============================================================
 
 
@@ -132,10 +132,19 @@ def save_state(state):
             pass
 
 
-def get_usd_to_cny_rate():
+def get_proxies(user):
+    """获取代理配置字典；未配置或为空时返回 None（直连）"""
+    proxy = user.get("proxy", "").strip() if isinstance(user, dict) else ""
+    if proxy:
+        return {"http": proxy, "https": proxy}
+    return None
+
+
+def get_usd_to_cny_rate(proxy=None):
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
         url = "https://api.exchangerate-api.com/v4/latest/USD"
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, timeout=5, proxies=proxies)
         if res.status_code == 200:
             rate = res.json().get("rates", {}).get("CNY")
             if rate:
@@ -223,10 +232,23 @@ def send_wxpush(wx_conf, title, content):
 
 
 def build_credential(user):
+    proxies = get_proxies(user)
+    kwargs = {"proxies": proxies} if proxies else {}
     return ClientSecretCredential(
         tenant_id=user["tenant_id"].strip(),
         client_id=user["client_id"].strip(),
         client_secret=user["client_secret"].strip(),
+        **kwargs
+    )
+
+
+def build_compute_client(user, credential):
+    proxies = get_proxies(user)
+    kwargs = {"proxies": proxies} if proxies else {}
+    return ComputeManagementClient(
+        credential,
+        user["subscription_id"].strip(),
+        **kwargs
     )
 
 
@@ -234,15 +256,8 @@ def get_token(credential):
     return credential.get_token(TOKEN_SCOPE).token
 
 
-def build_compute_client(user, credential):
-    return ComputeManagementClient(
-        credential,
-        user["subscription_id"].strip(),
-    )
-
-
 def azure_request(method, url, *, params=None, json_body=None, token=None,
-                  retries=API_RETRIES, timeout=None):
+                  retries=API_RETRIES, timeout=None, proxies=None):
     last_error = None
     timeout = timeout or (API_CONNECT_TIMEOUT, API_READ_TIMEOUT)
 
@@ -261,6 +276,7 @@ def azure_request(method, url, *, params=None, json_body=None, token=None,
                 json=json_body,
                 headers=headers,
                 timeout=timeout,
+                proxies=proxies,
             )
 
             if response.status_code in (429, 500, 502, 503, 504):
@@ -372,6 +388,7 @@ def get_vm_resource_id(user):
 
 def get_monthly_network_out(user, credential):
     token = get_token(credential)
+    proxies = get_proxies(user)
     resource_id = get_vm_resource_id(user)
     start = get_month_start_utc()
     end = datetime.now(timezone.utc)
@@ -380,9 +397,7 @@ def get_monthly_network_out(user, credential):
         f"{start.strftime('%Y-%m-%dT%H:%M:%SZ')}/"
         f"{end.strftime('%Y-%m-%dT%H:%M:%SZ')}"
     )
-    url = (
-        f"{MANAGEMENT_ENDPOINT}{resource_id}/providers/microsoft.insights/metrics"
-    )
+    url = f"{MANAGEMENT_ENDPOINT}{resource_id}/providers/microsoft.insights/metrics"
     params = {
         "api-version": METRICS_API_VERSION,
         "metricnames": "Network Out Total",
@@ -398,6 +413,7 @@ def get_monthly_network_out(user, credential):
         token=token,
         retries=API_RETRIES,
         timeout=(API_CONNECT_TIMEOUT, METRIC_READ_TIMEOUT),
+        proxies=proxies,
     )
 
     total_bytes = 0.0
@@ -427,6 +443,7 @@ def get_credit_start_date(user):
 
 def get_credit_usage(user, credential):
     token = get_token(credential)
+    proxies = get_proxies(user)
     subscription_id = user["subscription_id"].strip()
     scope = f"/subscriptions/{subscription_id}"
     url = f"{MANAGEMENT_ENDPOINT}{scope}/providers/Microsoft.CostManagement/query"
@@ -460,6 +477,7 @@ def get_credit_usage(user, credential):
         token=token,
         retries=API_RETRIES,
         timeout=(API_CONNECT_TIMEOUT, COST_READ_TIMEOUT),
+        proxies=proxies,
     )
 
     properties = data.get("properties", {})
@@ -644,7 +662,7 @@ def check_and_act(user, wx_conf, state):
         item["last_cost_check_ts"] = time.time()
         try:
             raw_cost, cur = get_credit_usage(user, credential)
-            current_rate = get_usd_to_cny_rate()
+            current_rate = get_usd_to_cny_rate(user.get("proxy", "").strip())
             if cur == "CNY":
                 credit_used = raw_cost / current_rate
                 logger.info(f"[{name}] Cost API 返回 ¥{raw_cost:.2f} CNY，已折算为 ${credit_used:.2f} USD")
