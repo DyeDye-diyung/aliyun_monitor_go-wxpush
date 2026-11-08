@@ -323,7 +323,9 @@ def main():
     # ================= 拼接与推送 =================
     push_title = f"阿里云财报: 成功{success_count}, 失败{fail_count}"
     
-    header = f"📊 [阿里云多账号 - 每日财报]\n"
+    header = f"阿里云日报 成功：{success_count} 失败：{fail_count}\n"
+    header += "--------------------------------\n"
+    header += f"📊 [阿里云多账号 - 每日财报]\n"
     header += f"📅 日期: {today} (实时汇率: {current_rate:.2f})\n"
     header += f"✅ 成功机器：{success_count}，❌ 失败机器：{fail_count}\n"
     header += "--------------------------------\n"
