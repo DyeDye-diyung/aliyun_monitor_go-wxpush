@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Azure for Students 每日报告 (支持代理与直连双模式)
+Azure for Students 每日报告 (支持代理与直连双模式、权威 vm.id 与详细 JSON 报错推送)
 """
 
 import json
@@ -88,7 +88,7 @@ if not logger.handlers:
 
 
 # ============================================================
-# Config / State / 代理工具函数
+# Config / State / 代理 / 错误处理工具函数
 # ============================================================
 
 
@@ -116,6 +116,19 @@ def get_proxies(user):
     if proxy:
         return {"http": proxy, "https": proxy}
     return None
+
+
+def format_error_detail(e):
+    """提取异常详细信息，自动提取并追加 HTTP 响应体中的详细 JSON 报错内容"""
+    msg = str(e)
+    if hasattr(e, "response") and e.response is not None:
+        try:
+            text = e.response.text.strip()
+            if text and text not in msg:
+                msg = f"{msg} | 响应详情: {text}"
+        except Exception:
+            pass
+    return msg
 
 
 # ============================================================
@@ -264,13 +277,22 @@ def azure_request(method, url, *, params=None, json_body=None, token=None,
 
         except Exception as e:
             last_error = e
+            err_detail = ""
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    err_detail = f" | 响应详情: {e.response.text}"
+                except Exception:
+                    pass
+
             logger.warning(
-                f"Azure API {method} {url} 失败 (尝试 {attempt}/{retries}): {e}"
+                f"Azure API {method} {url} 失败 (尝试 {attempt}/{retries}): {e}{err_detail}"
             )
             if attempt < retries:
                 time.sleep(2 * attempt)
 
-    raise last_error
+    # 包装完整的错误描述（附带响应详情文本），以便抛出后被推送捕获
+    detail_msg = format_error_detail(last_error)
+    raise RuntimeError(detail_msg) from last_error
 
 
 def get_vm_status(compute_client, user):
@@ -294,6 +316,7 @@ def get_vm_info(compute_client, user):
         "size": getattr(vm.hardware_profile, "vm_size", "N/A"),
         "location": getattr(vm, "location", "N/A"),
         "vm_obj": vm,
+        "id": getattr(vm, "id", None),  # Azure 内部权威 resource_id
     }
 
 
@@ -342,10 +365,13 @@ def get_month_start_utc():
     return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
 
-def get_monthly_network_out(user, credential):
+def get_monthly_network_out(user, credential, resource_id=None):
+    """查询当月 Network Out Total 出站流量，优先使用权威 resource_id"""
     token = get_token(credential)
     proxies = get_proxies(user)
-    resource_id = get_vm_resource_id(user)
+    if not resource_id:
+        resource_id = get_vm_resource_id(user)
+
     start = get_month_start_utc()
     end = datetime.now(timezone.utc)
 
@@ -524,7 +550,6 @@ def main():
             logger.info("config.json 中没有 Azure 配置，任务结束。")
             return
 
-        # 优先使用首个有效配置的代理来获取汇率，避免国内拉取汇率超时
         default_proxy = next((u.get("proxy", "").strip() for u in azure_users if u.get("proxy")), None)
         current_rate = get_usd_to_cny_rate(default_proxy)
 
@@ -532,10 +557,12 @@ def main():
         success_count = 0
         fail_count = 0
         report_lines = []
-        credit_cache = {}  # 缓存同订阅同周期的 Cost，避免多 VM 产生重复请求
+        credit_cache = {}
 
         header = (
-            "📊 [Azure Student - 每日财报]\n"
+            f"Azure日报 成功：{{success}} 失败：{{fail}}\n"
+            "--------------------------------\n"
+            "📊 [Azure Student - 每日财报]\n"           
             f"📅 日期: {today} (实时汇率: {current_rate:.2f})\n"
             f"✅ 成功机器：{{success}}，❌ 失败机器：{{fail}}\n"
             "--------------------------------\n"
@@ -561,7 +588,9 @@ def main():
                 info = get_vm_info(compute_client, user)
                 ip = get_vm_public_ip(user, credential, info["vm_obj"])
 
-                traffic_bytes = get_monthly_network_out(user, credential)
+                # 优先传入 Azure 官方权威 vm.id，彻底规避资源组/实例名大小写映射 404
+                canonical_id = info.get("id")
+                traffic_bytes = get_monthly_network_out(user, credential, resource_id=canonical_id)
                 traffic_gb = bytes_to_gb(traffic_bytes)
 
                 generic_free = float(user.get("generic_free_gb", 100))
@@ -569,7 +598,6 @@ def main():
                 traffic_limit = float(user.get("traffic_limit", 110))
                 credit_limit = float(user.get("credit_limit", 100))
 
-                # 复用订阅级 Credit 缓存 (自适应汇率折算为标准 USD)
                 sub_key = f"{user['subscription_id'].strip()}::{user.get('credit_start_date', '').strip()}"
                 if sub_key in credit_cache:
                     credit_used, credit_error = credit_cache[sub_key]
@@ -585,11 +613,10 @@ def main():
                             credit_used = raw_cost
                             logger.info(f"[{name}] Cost API 返回 ${credit_used:.2f} USD")
                     except Exception as e:
-                        credit_error = e
-                        logger.error(f"[{name}] Cost 查询失败: {e}")
+                        credit_error = format_error_detail(e)
+                        logger.error(f"[{name}] Cost 查询失败: {credit_error}")
                     credit_cache[sub_key] = (credit_used, credit_error)
 
-                # 保护状态识别
                 key = (
                     f"{user.get('subscription_id', '').strip()}::"
                     f"{user.get('resource_group', '').strip()}::"
@@ -599,7 +626,6 @@ def main():
                 guarded = guard.get("deallocated_by_guard", False)
                 guard_reason = guard.get("guard_reason")
 
-                # 图标展示
                 if status == "running":
                     run_icon = "🟢"
                 elif status == "deallocated":
@@ -609,7 +635,6 @@ def main():
                 else:
                     run_icon = "❓"
 
-                # 流量计算与评价
                 percent = (traffic_gb / traffic_limit) * 100 if traffic_limit > 0 else 0
                 if traffic_gb >= traffic_limit:
                     traffic_status = "🚨 已触发自动止损"
@@ -618,7 +643,6 @@ def main():
                 else:
                     traffic_status = "✅ 免费额度内安全"
 
-                # Credit 评价与双币种换算
                 if credit_error is not None:
                     credit_status = "❓ 查询失败"
                     credit_text = "查询失败"
@@ -649,7 +673,6 @@ def main():
                 else:
                     guard_status = "✅ 监控正常运行中"
 
-                # 拼装单机器日报卡片
                 report_lines.append(
                     f"👤 *{sanitize_markdown(name)}* ({sanitize_markdown(info['size'])})\n"
                     f"   🖥️ 状态: {run_icon} {sanitize_markdown(status)}\n"
@@ -672,7 +695,9 @@ def main():
 
             except Exception as e:
                 fail_count += 1
-                err_msg = f"❌ *{sanitize_markdown(name)}* Error: {sanitize_markdown(str(e))}\n"
+                # 附带提取并拼接详细的响应 JSON
+                err_detail = format_error_detail(e)
+                err_msg = f"❌ *{sanitize_markdown(name)}* Error: {sanitize_markdown(err_detail)}\n"
                 report_lines.append(err_msg)
                 logger.exception(f"处理 Azure 用户 {name} 时出错")
 
@@ -701,3 +726,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
